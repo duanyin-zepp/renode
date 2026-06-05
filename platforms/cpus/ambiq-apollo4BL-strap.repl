@@ -3,7 +3,11 @@ cpu: CPU.CortexM @ sysbus
     nvic: nvic
     PerformanceInMips: 96
 
-nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+// Cortex™ -M4 Devices Generic User Guide
+// // NVIC 实际 开始于 0xE000E100, 但代码中多用了前面0x100 空间
+// 8 different priority levels are available in SOC
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000  
+    priorityMask: 0xE0  //  优先级位放在高位
     -> cpu@0
 
 // Memory
