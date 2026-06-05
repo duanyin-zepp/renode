@@ -6,7 +6,7 @@ $name?="Ambiq Apollo 4BL"
 mach create $name
 logLevel -1
 machine LoadPlatformDescription @platforms/cpus/ambiq-apollo4BL-strap.repl
-showAnalyzer uart2
+showAnalyzer uart0
 
 sysbus.iom1.CW6305B Write [0x0]   : chip id
 sysbus.iom1.CW6305B Write [0x14]
