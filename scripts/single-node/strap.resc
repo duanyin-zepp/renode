@@ -8,6 +8,10 @@ logLevel -1
 machine LoadPlatformDescription @platforms/cpus/ambiq-apollo4BL-strap.repl
 showAnalyzer uart2
 
+sysbus.iom1.CW6305B Write [0x0]   : chip id
+sysbus.iom1.CW6305B Write [0x14]
+sysbus.iom1.CW6305B Reset
+
 $bin?=@/home/dyin/dev/strap/build/out/watch@apollo4/binary/watch@apollo4.elf
 macro reset
 """

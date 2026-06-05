@@ -154,6 +154,11 @@ iom6: SPI.AmbiqApollo4_IOMaster @ sysbus 0x40056000
 iom7: SPI.AmbiqApollo4_IOMaster @ sysbus 0x40057000
     -> nvic@13
 
+// 挂载 I2C 设备
+
+CW6305B: Memory.GenericI2cEeprom @ iom1 0xb
+    size: 256
+
 rtc: Timers.AmbiqApollo4_RTC @ sysbus 0x40004800
     -> nvic@2
 
