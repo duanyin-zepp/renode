@@ -1,0 +1,17 @@
+:name: Ambiq Apollo 4BL
+:description: This script runs the zeppOS's strap firmware on Ambiq Apollo 4BL.
+
+using sysbus
+$name?="Ambiq Apollo 4BL"
+mach create $name
+
+machine LoadPlatformDescription @platforms/cpus/ambiq-apollo4BL-strap.repl
+showAnalyzer uart2
+
+$bin?=@/home/dyin/dev/strap/build/out/watch@apollo4/binary/watch@apollo4.elf
+macro reset
+"""
+    sysbus LoadELF $bin
+"""
+
+runMacro $reset
