@@ -202,7 +202,11 @@ uart2: UART.PL011 @ sysbus 0x4001E000
 uart3: UART.PL011 @ sysbus 0x4001F000
     -> nvic@18
 
-pwrctrl: Miscellaneous.AmbiqApollo4_PowerController @ sysbus 0x40021000
+//pwrctrl: Miscellaneous.AmbiqApollo4_PowerController @ sysbus 0x40021000
+pwrctrl: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    // VRSTATUS:  set SIMOBUCKST to ACT
+    filename: "scripts/pydev/strap_powctl.py"
 
 security: Miscellaneous.AmbiqApollo4_Security @ sysbus 0x40030000
 
