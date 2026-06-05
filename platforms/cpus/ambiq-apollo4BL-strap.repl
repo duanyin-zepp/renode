@@ -84,14 +84,24 @@ bootrom: Memory.MappedMemory @ sysbus 0x08000000
         WriteWord 0x230 0x2000  // asm: movs r0, #0        // set return value to OK
         WriteWord 0x232 0x4770  // asm: bx lr              // return
 
+// With 2 MB of MRAM and 1.375 MB of SRAM (1MB SRAM + 384KB TCM)
+
+// Apollo4 Blue Lite SoC has 2MB of MRAM (0x00000000)
 mcu_mram: Memory.MappedMemory @ sysbus 0x00000000
     size: 0x200000
 
+// 384KB of CPU SRAM (TCM, Tightly Coupled Memory)
 mcu_tcm: Memory.MappedMemory @ sysbus 0x10000000
     size: 0x60000
 
+// 1MB System SRAM
 shared_sram: Memory.MappedMemory @ sysbus 0x10060000
     size: 0x100000
+
+// 16MB PSRAM (W957) on MSPI0
+psram: Memory.MappedMemory @ sysbus 0x14000000
+    size: 0x1000000
+
 
 // Other peripherals
 
