@@ -4,7 +4,7 @@
 using sysbus
 $name?="Ambiq Apollo 4BL"
 mach create $name
-
+logLevel -1
 machine LoadPlatformDescription @platforms/cpus/ambiq-apollo4BL-strap.repl
 showAnalyzer uart2
 
@@ -15,3 +15,5 @@ macro reset
 """
 
 runMacro $reset
+machine StartGdbServer 3333
+
