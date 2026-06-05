@@ -12,7 +12,10 @@
             "cwd": "${config:workspacePointer}",
             // For more information about the 'console' field, see https://aka.ms/VSCode-CS-LaunchJson-Console
             "console": "internalConsole",
-            "stopAtEntry": false
+            "stopAtEntry": false,
+            "args": [
+                "${workspaceFolder}/scripts/single-node/strap.resc"
+            ],
         },
         {
             "name": "Attach",
