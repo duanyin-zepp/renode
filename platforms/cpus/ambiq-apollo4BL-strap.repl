@@ -11,6 +11,12 @@ nvic: IRQControllers.NVIC @ sysbus 0xE000E000
     -> cpu@0
 
 // Memory
+// The Apollo4 Blue Lite SoC integrates four kinds of memory:
+// ▪ 1.375 MB of SRAM (1MB SRAM + 384KB TCM)
+// ▪ Integrated NVM (2MB of MRAM)
+// ▪ Boot Loader ROM
+// ▪ 16KB One Time Programmable (OTP) memory
+//     -  2 kB for customer use, including NVM protection fields
 
 // Renode-only helper peripheral placed in reserved address space.
 // The error is logged with an unimplemented function's name if a valid
@@ -87,8 +93,6 @@ bootrom: Memory.MappedMemory @ sysbus 0x08000000
         WriteWord 0x22E 0xDAFA  // asm: bge  0x226         // jump to 0x226 if not negative
         WriteWord 0x230 0x2000  // asm: movs r0, #0        // set return value to OK
         WriteWord 0x232 0x4770  // asm: bx lr              // return
-
-// With 2 MB of MRAM and 1.375 MB of SRAM (1MB SRAM + 384KB TCM)
 
 // Apollo4 Blue Lite SoC has 2MB of MRAM (0x00000000)
 mcu_mram: Memory.MappedMemory @ sysbus 0x00000000
@@ -224,13 +228,17 @@ cpu_complex: Python.PythonPeripheral @ sysbus 0x48000000
 
 sysbus:
     init:
+        SilenceRange <0x40004000, 0x400047FF>  // CLKGEN
+        SilenceRange <0x40014000, 0x400143FF>  // NVM Cache Control
         SilenceRange <0x40020000, 0x40020FFF>  // MCUCTRL
+        SilenceRange <0x42000000, 0x4200FFFF>  // NVM_OTP
         SilenceRange <0x47FF0000, 0x47FF0004>  // SYNC_READ
+        SilenceRange <0xF0000000, 0xF0000FFF>  // JEDEC
 
         Tag <0x0800004D,0x0800009F> "CPU_BOOTROM"
-        Tag <0x40004000,0x40004FFF> "CLKGEN"
+        Tag <0x40004000,0x400047FF> "CLKGEN"
         Tag <0x40008000,0x400087FF> "TIMER"
-        Tag <0x40014000,0x40014FFF> "MRAM"
+        Tag <0x40014000,0x400143FF> "NVM Cache Control"
 
         Tag <0x400C0000,0x400C3FFF> "CRYPTO"
         Tag <0x400C2000,0x400C3FFF> "OTP"
