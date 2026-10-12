@@ -95,6 +95,7 @@ ${WORKSHOP_ASSEMBLY}                SEPARATOR=\n
 
 *** Keywords ***
 Create HiFive1 Demo
+    Test Setup
     Execute Command                 mach create
     Execute Command                 machine LoadPlatformDescription @platforms/cpus/sifive-fe310.repl
     Execute Command                 cpu AssembleBlock ${ENTRYPOINT} "${ASSEMBLY}"
@@ -102,6 +103,7 @@ Create HiFive1 Demo
     Execute Command                 machine StartGdbServer ${GDB_REMOTE_PORT}
 
 Create HiFive1 Workshop Demo
+    Test Setup
     Execute Command                 mach create
     Execute Command                 machine LoadPlatformDescription @platforms/cpus/sifive-fe310.repl
     Execute Command                 cpu AssembleBlock ${ENTRYPOINT} "${WORKSHOP_ASSEMBLY}"
@@ -136,7 +138,7 @@ Compare General Registers
 
 *** Test Cases ***
 Should Set Registers Properly
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
 
@@ -151,7 +153,7 @@ Should Set Registers Properly
     Compare General Registers       sysbus.cpu
 
 Should Revert To Jump
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
 
@@ -165,7 +167,7 @@ Should Revert To Jump
     Should Be Equal As Numbers      ${expected_pc}  ${result_pc}
 
 Should Stop At Breakpoint After Stepping Back
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
 
@@ -187,19 +189,19 @@ Should Stop At Breakpoint After Stepping Back
     Should Be Equal As Numbers      ${expected_icount}  ${result_icount}
 
 Should Log Warning When No Snapshots Taken
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Create Log Tester               1
 
     Command Gdb                     stepi
     ${expected_pc}=                 Execute Command  sysbus.cpu PC
     Command Gdb                     reverse-stepi
-    Wait For Log Entry              There are no snapshots taken before this timestamp.
+    Wait For Log Entry              There are no snapshots taken before this timestamp
     ${result_pc}=                   Execute Command  sysbus.cpu PC
     Should Be Equal As Numbers      ${expected_pc}  ${result_pc}
 
 Should Preserve Peripheral Logging Level
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Create Log Tester               1
     Execute Command                 reverseExecMode true
@@ -212,7 +214,7 @@ Should Preserve Peripheral Logging Level
     Wait For Log Entry              cpu: Stepping 1 step(s)
 
 Should Preserve Peripheral Access Logging
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Create Log Tester               1
     Execute Command                 reverseExecMode true
@@ -227,7 +229,7 @@ Should Preserve Peripheral Access Logging
     Wait For Log Entry              uart0: [cpu: 0x80000024] WriteUInt32 to 0x0 (TransmitData), value 0x2A
 
 Should Preserve Gdb Logging
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Create Log Tester               1
     Execute Command                 reverseExecMode true
@@ -240,7 +242,7 @@ Should Preserve Gdb Logging
     Wait For Log Entry              cpu: GDB packet received
 
 Should Preserve Function Names Logging
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Create Log Tester               1
     Execute Command                 reverseExecMode true
@@ -253,7 +255,7 @@ Should Preserve Function Names Logging
     Wait For Log Entry              cpu: Entering function
 
 Should Step Three Steps Back
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run GDB               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
 
@@ -273,7 +275,7 @@ Should Step Three Steps Back
     Should Be Equal As Numbers      ${expected_icount}  ${result_icount}
 
 Should Stop At Breakpoint On Previous Instruction
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
     Command Gdb                     break *${ENTRYPOINT}+0x08
@@ -287,7 +289,7 @@ Should Stop At Breakpoint On Previous Instruction
     Should Be Equal As Numbers      ${expected_pc}  ${result_pc}
 
 Should Revert To The Beginning
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
     Command Gdb                     break *${ENTRYPOINT}+0x08
@@ -299,7 +301,7 @@ Should Revert To The Beginning
     Should Be Equal As Numbers      ${result_icount}  0
 
 Should Not Stop On Deleted Breakpoint
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run Gdb               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
     Command Gdb                     break *${ENTRYPOINT}+0x08
@@ -315,7 +317,7 @@ Should Not Stop On Deleted Breakpoint
     Should Be Equal As Numbers      ${expected_pc}  ${result_pc}
 
 Should Ignore First Breakpoint Occurence
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run GDB               riscv64-zephyr-elf-gdb
     Execute Command                 reverseExecMode true
     Command GDB                     break *${ENTRYPOINT}+0x34
@@ -359,7 +361,7 @@ Should Visit Both Branches
     Wait For Line On Uart           OK
 
 Should Step Back From Infinite Loop
-    [Tags]                          skip_windows
+    [Tags]                          exclude_windows
     Check And Run GDB               riscv64-zephyr-elf-gdb
     Execute Command                 autoSave true 0.1
 

@@ -14,6 +14,7 @@ import uuid
 import re
 import signal
 from collections import OrderedDict, defaultdict
+from copy import deepcopy
 from time import monotonic, sleep
 from typing import List, Dict, Tuple, Set, Optional, Union
 from argparse import Namespace
@@ -26,7 +27,12 @@ from robot.libraries.DateTime import Time
 import xml.etree.ElementTree as ET
 import urllib.parse
 
-from tests_engine import TestResult
+from tests_engine import TestResult, TestTag, CRITICAL_TEST
+from unstable_tests import KnownUnstableSuite, filter_unstable
+from retry_and_timeout_listener import retry_and_timeout_listener
+from state_dependency_listener import StateDependencyListener
+import robot_output_formatter
+import robot_output_formatter_verbose
 
 this_path = os.path.abspath(os.path.dirname(__file__))
 
@@ -34,6 +40,11 @@ keywords_path = os.path.abspath(os.path.join(this_path, "renode-keywords.robot")
 keywords_path = keywords_path.replace(os.path.sep, "/")  # Robot wants forward slashes even on Windows
 
 DEFAULT_RENODE_BINARY_NAME = 'Renode.dll'
+
+if platform == "win32":
+    CREATE_NEW_PROCESS_GROUP = 0x00000200  # subprocess.CREATE_NEW_PROCESS_GROUP
+else:
+    CREATE_NEW_PROCESS_GROUP = 0
 
 @dataclass(frozen=True)
 class CpuTime:
@@ -193,6 +204,7 @@ def install_cli_arguments(parser):
                         help="Port of robot framework remote server binary. Use '0' to automatically select any unused private port.")
 
     parser.add_argument("--enable-xwt",
+                        "--enable-gui",
                         dest="enable_xwt",
                         action="store_true",
                         default=False,
@@ -433,8 +445,10 @@ class RobotTestSuite(object):
     robot_frontend_process = None
     renode_pid = -1  # It's not always robot_frontend_process.pid, e.g., with `--run-gdb` option.
     hotspot_action = ['None', 'Pause', 'Serialize']
-    # Used to share the port between all suites when running sequentially
+    # Used to share the port, directory and command used by Renode between all suites when running sequentially
     remote_server_port = -1
+    remote_server_directory = None
+    remote_server_command = []
     retry_test_regex = re.compile(r"\[RETRY\] (PASS|FAIL) on (\d+)\. retry\.")
     retry_suite_regex = re.compile(r"|".join((
             r"\[Errno \d+\] Connection refused",
@@ -447,13 +461,15 @@ class RobotTestSuite(object):
 
     def __init__(self, path):
         self.path = path
+        self.known_unstable: Optional[KnownUnstableSuite] = None
         self._dependencies_met = set()
-        self.remote_server_directory = None
+        self.missing_state_reasons: dict[str, str] = {}
         # Subset of RobotTestSuite.log_files which are "owned" by the running instance
         self.suite_log_files = None
 
         self.tests_with_hotspots = []
         self.tests_without_hotspots = []
+        self.selected_tests: List[Tuple[Optional[str], List[str]]] = []
 
 
     def get_output_dir(self, options, iteration_index, suite_retry_index):
@@ -464,9 +480,7 @@ class RobotTestSuite(object):
         )
 
 
-    def prepare(self, options):
-        RobotTestSuite.instances_count += 1
-
+    def _find_tests(self) -> robot.running.TestSuite:
         hotSpotTestFinder = TestsFinder(keyword="Handle Hot Spot")
         suiteBuilder = robot.running.builder.TestSuiteBuilder()
         suite = suiteBuilder.build(self.path)
@@ -474,6 +488,41 @@ class RobotTestSuite(object):
 
         self.tests_with_hotspots = [test.name for test in hotSpotTestFinder.tests_matching]
         self.tests_without_hotspots = [test.name for test in hotSpotTestFinder.tests_not_matching]
+        return suite
+
+
+    def select_tests(self, options: Namespace) -> bool:
+        """Select tests and return whether the suite should remain scheduled."""
+        self.selected_tests = []
+        if self.path.endswith('renode-keywords.robot'):
+            print('Ignoring helper file: {}'.format(self.path))
+            return False
+
+        suite = self._find_tests()
+
+        # Hot-spot tests run once per selected action. Fixture matching includes
+        # the action in the suite name, so filter each variant separately.
+        variants: List[Tuple[Optional[str], List[str]]] = [(None, self.tests_without_hotspots)]
+        variants.extend((hotspot, self.tests_with_hotspots)
+                        for hotspot in self.hotspot_action
+                        if not options.hotspot or options.hotspot == hotspot)
+
+        for hotspot, test_names in variants:
+            if not test_names:
+                continue
+
+            # Robot filters and renames the model in place, so make a copy.
+            suite_copy = deepcopy(suite)
+            selected = self._get_test_suite(options, test_names, options.fixture, hotspot,
+                                            suite=suite_copy)
+            if selected.test_count:
+                self.selected_tests.append((hotspot, [test.name for test in selected.tests]))
+
+        return len(self.selected_tests) > 0
+
+
+    def prepare(self, options):
+        RobotTestSuite.instances_count += 1
 
         # In parallel runs, Renode is started for each suite.
         # The same is done in sequential runs with --keep-renode-output.
@@ -495,10 +544,10 @@ class RobotTestSuite(object):
         # Let's reset PID and check it's set before returning to prevent keeping old PID.
         self.renode_pid = -1
 
-        prepend_dotnet = options.remote_server_name == DEFAULT_RENODE_BINARY_NAME
+        prepend_dotnet = options.remote_server_name.endswith('.dll')
 
-        self.remote_server_directory = options.remote_server_full_directory
-        remote_server_binary = os.path.join(self.remote_server_directory, options.remote_server_name)
+        RobotTestSuite.remote_server_directory = options.remote_server_full_directory
+        remote_server_binary = os.path.join(RobotTestSuite.remote_server_directory, options.remote_server_name)
 
         if not os.path.isfile(remote_server_binary):
             raise Exception("Robot framework remote server binary not found: '{}'! Did you forget to build?".format(remote_server_binary))
@@ -508,21 +557,25 @@ class RobotTestSuite(object):
         if remote_server_port != 0 and not is_port_available(remote_server_port, options.autokill_renode):
             raise Exception("The selected port {} is not available".format(remote_server_port))
 
-        command = [remote_server_binary, '--robot-server-port', str(remote_server_port)]
+        command = [remote_server_binary]
+
+        if prepend_dotnet:
+            command.insert(0, 'dotnet')
         if not options.show_log and not options.keep_renode_output:
             command.append('--hide-log')
         if not options.enable_xwt:
             command.append('--disable-gui')
-        if options.debug_on_error:
-            command.append('--robot-debug-on-error')
         if options.keep_temps:
             command.append('--keep-temporary-files')
         if options.renode_config:
             command.append('--config')
             command.append(options.renode_config)
 
-        if prepend_dotnet:
-            command.insert(0, 'dotnet')
+        RobotTestSuite.remote_server_command = list(command) # For the purpose of running another Renode in a test
+
+        if options.debug_on_error:
+            command.append('--robot-debug-on-error')
+        command.extend(['--robot-server-port', str(remote_server_port)])
 
         renode_command = command
         stdout_path, stderr_path = None, None
@@ -530,7 +583,7 @@ class RobotTestSuite(object):
         # if we started GDB, wait for the user to start Renode as a child process
         if options.run_gdb:
             command = ['gdb', '-nx', '-ex', 'handle SIG34 nostop noprint', '--args'] + command
-            process = psutil.Popen(command, cwd=self.remote_server_directory, bufsize=1)
+            process = psutil.Popen(command, cwd=RobotTestSuite.remote_server_directory, bufsize=1)
 
             if options.keep_renode_output:
                 print("Note: --keep-renode-output is not supported when using --run-gdb")
@@ -561,9 +614,9 @@ class RobotTestSuite(object):
             print(f"WARNING: perf stdout and stderr is being redirected to {stdout_path}")
 
             perf_stdout_stderr_file = open(stdout_path, "w")
-            process = subprocess.Popen(command, cwd=self.remote_server_directory, bufsize=1, stdout=perf_stdout_stderr_file, stderr=perf_stdout_stderr_file)
+            process = subprocess.Popen(command, cwd=RobotTestSuite.remote_server_directory, bufsize=1, stdout=perf_stdout_stderr_file, stderr=perf_stdout_stderr_file, creationflags=CREATE_NEW_PROCESS_GROUP)
 
-            pid_file_path = os.path.join(self.remote_server_directory, pid_filename)
+            pid_file_path = os.path.join(RobotTestSuite.remote_server_directory, pid_filename)
             perf_renode_timeout = 10
 
             if process.pid == -1:
@@ -591,13 +644,13 @@ class RobotTestSuite(object):
                 stderr_path = os.path.join(logs_dir, f"{suite_name}.renode_stderr.log")
                 fout = open(stdout_path, "wb", buffering=0)
                 ferr = open(stderr_path, "wb", buffering=0)
-                process = subprocess.Popen(command, cwd=self.remote_server_directory, bufsize=1, stdout=fout, stderr=ferr)
+                process = subprocess.Popen(command, cwd=RobotTestSuite.remote_server_directory, bufsize=1, stdout=fout, stderr=ferr, creationflags=CREATE_NEW_PROCESS_GROUP)
                 if process.pid == -1:
                     report_dead_subprocess(process)
 
                 self.renode_pid = process.pid
             else:
-                process = subprocess.Popen(command, cwd=self.remote_server_directory, bufsize=1)
+                process = subprocess.Popen(command, cwd=RobotTestSuite.remote_server_directory, bufsize=1, creationflags=CREATE_NEW_PROCESS_GROUP)
                 if process.pid == -1:
                     report_dead_subprocess(process)
                 self.renode_pid = process.pid
@@ -673,7 +726,7 @@ class RobotTestSuite(object):
         print(process_summary)
 
     def __move_perf_data(self, options):
-        perf_data_path = os.path.join(self.remote_server_directory, "perf.data")
+        perf_data_path = os.path.join(RobotTestSuite.remote_server_directory, "perf.data")
 
         if not perf_data_path:
             raise RuntimeError("perf.data file was not generated succesfully")
@@ -734,6 +787,14 @@ class RobotTestSuite(object):
         else:
             print(f"{renode} closed")
 
+    @staticmethod
+    def _is_retried_attempt(test: ET.Element) -> bool:
+        """Whether this `test` element is a non-final attempt of a test retried with `-N/--retry`.
+
+        Only the last attempt carries the test's final verdict; the earlier ones are kept
+        in the output for their failure messages and logs."""
+        return any(tag.text == TestTag.RETRIED_ATTEMPT for tag in test.findall('tag'))
+
     @classmethod
     def _has_renode_crashed(cls, test: ET.Element) -> bool:
         # only finds immediate children - required because `status`
@@ -743,28 +804,11 @@ class RobotTestSuite(object):
         if status.text is not None and cls.retry_suite_regex.search(status.text):
             return True
         else:
-            return any(cls.retry_suite_regex.search(msg.text) for msg in test.iter("msg"))
+            return any(cls.retry_suite_regex.search(msg.text) for msg in test.iter("msg") if msg.text is not None)
 
 
     def run(self, options, iteration_index=1, suite_retry_index=0):
-        if self.path.endswith('renode-keywords.robot'):
-            print('Ignoring helper file: {}'.format(self.path))
-            return True
-
-        tests_len = 0
-        suites_with_hotspots = []
-        if any(self.tests_without_hotspots):
-            suite_without_hotspots = self._get_test_suite(options, self.tests_without_hotspots, options.fixture, None)
-            tests_len = len(suite_without_hotspots.tests)
-        if any(self.tests_with_hotspots):
-            for hotspot in RobotTestSuite.hotspot_action:
-                if options.hotspot and options.hotspot != hotspot:
-                    continue
-                suite_with_hotspots = self._get_test_suite(options, self.tests_with_hotspots, options.fixture, hotspot)
-                suites_with_hotspots.append((hotspot, suite_with_hotspots))
-                tests_len += len(suite_with_hotspots.tests)
-
-        if tests_len == 0:
+        if not self.selected_tests:
             return TestResult(True, [])
 
         # The list is cleared only on the first run attempt in each iteration so
@@ -782,7 +826,7 @@ class RobotTestSuite(object):
             # shared, they're only needed to restart Renode in timeout handler.
             RobotTestSuite.robot_frontend_process = self._run_remote_server(options, iteration_index, suite_retry_index)
 
-        print(f'Running suite on Renode pid {self.renode_pid} using port {self.remote_server_port}: {self.path}')
+        print(f'Running suite on Renode pid {self.renode_pid} using port {self.remote_server_port}: {self.path}', flush=True)
 
         result = None
         def get_result():
@@ -790,22 +834,15 @@ class RobotTestSuite(object):
 
         start_timestamp = monotonic()
 
-        if any(self.tests_without_hotspots):
-            result = get_result().ok and self._run_inner(suite_without_hotspots,
+        for hotspot, test_names in self.selected_tests:
+            suite = self._get_test_suite(options, test_names, None, hotspot)
+            result = get_result().ok and self._run_inner(suite,
                                                          options.fixture,
-                                                         None,
-                                                         self.tests_without_hotspots,
+                                                         hotspot,
+                                                         test_names,
                                                          options,
                                                          iteration_index,
                                                          suite_retry_index)
-        for hotspot, suite in suites_with_hotspots:
-                result = get_result().ok and self._run_inner(suite,
-                                                             options.fixture,
-                                                             hotspot,
-                                                             self.tests_with_hotspots,
-                                                             options,
-                                                             iteration_index,
-                                                             suite_retry_index)
 
         end_timestamp = monotonic()
 
@@ -829,9 +866,12 @@ class RobotTestSuite(object):
 
             if renode_pid != -1:
                 renode_memory_stats = {"peak_unique_set_size_bytes": monitor.get_peak_and_reset()}
-                renode_process = psutil.Process(renode_pid)
-                stats = collect_process_stats(renode_process)
-                renode_process_stats = stats.to_metadata() if stats else {}
+                try:
+                    renode_process = psutil.Process(renode_pid)
+                    stats = collect_process_stats(renode_process)
+                    renode_process_stats = stats.to_metadata() if stats else {}
+                except psutil.NoSuchProcess as err:
+                    print(f"error: Failed to collect process statistics for PID `{renode_pid}`: {err}")
 
         logs = get_result()[1]
         for log in logs: 
@@ -972,8 +1012,9 @@ class RobotTestSuite(object):
 
                 # Look for regular expressions signifying a crash.
                 # Suite Setup and Suite Teardown aren't checked here cause they're in the `kw` tags.
+                # Attempts recovered by a test-level retry don't warrant rerunning the suite.
                 for test in suite.iter('test'):
-                    if self._has_renode_crashed(test):
+                    if not self._is_retried_attempt(test) and self._has_renode_crashed(test):
                         return True
 
         return False
@@ -991,15 +1032,17 @@ class RobotTestSuite(object):
         suite = self._get_test_suite(options, test_cases_names, None, None)
         return self._run_inner(suite, None, None, test_cases_names, options, iteration_index, suite_retry_index)
 
-    def _get_test_suite(self, options, test_cases_names, fixture, hotspot):
+    def _get_test_suite(self, options, test_cases_names, fixture, hotspot,
+                        suite: Optional[robot.running.TestSuite] = None):
         file_name = os.path.splitext(os.path.basename(self.path))[0]
         suite_name = RobotTestSuite._create_suite_name(file_name, hotspot)
 
         test_cases = [(test_name, '{0}.{1}'.format(suite_name, test_name)) for test_name in test_cases_names]
         if fixture:
             test_cases = [x for x in test_cases if fnmatch.fnmatch(x[1], '*' + fixture + '*')]
-        suite_builder = robot.running.builder.TestSuiteBuilder()
-        suite = suite_builder.build(self.path)
+        if suite is None:
+            suite = robot.running.builder.TestSuiteBuilder().build(self.path)
+
         suite.resource.imports.create(type="Resource", name=keywords_path)
 
         metadata = {"HotSpot_Action": hotspot if hotspot else '-'}
@@ -1020,7 +1063,8 @@ class RobotTestSuite(object):
         output_dir = self.get_output_dir(options, iteration_index, suite_retry_index)
         variables = [
             'SKIP_RUNNING_SERVER:True',
-            'DIRECTORY:{}'.format(self.remote_server_directory),
+            'DIRECTORY:{}'.format(RobotTestSuite.remote_server_directory),
+            'COMMAND:{}'.format(subprocess.list2cmdline(RobotTestSuite.remote_server_command)),
             'PORT_NUMBER:{}'.format(self.remote_server_port),
             'RESULTS_DIRECTORY:{}'.format(output_dir),
             'BINARY_NAME:{}'.format(options.remote_server_name),
@@ -1040,20 +1084,27 @@ class RobotTestSuite(object):
         if options.variables:
             variables += options.variables
 
+        if self.known_unstable:
+            # We still run known-unstable tests, but they're allowed to fail.
+            for unstable_test in filter_unstable(self.known_unstable, suite.tests):
+                unstable_test.tags.add(TestTag.UNSTABLE)
+
         test_cases = [(test.name, '{0}.{1}'.format(suite_name, test.name)) for test in suite.tests]
         if fixture:
             deps = set()
             for test_name in (t[0] for t in test_cases):
                 deps.update(self._get_dependencies(test_name))
             if not self._run_dependencies(deps, options, iteration_index, suite_retry_index):
-                return False
+                return TestResult(False, None)
 
         # Listeners are called in the exact order as in `listeners` list for both `start_test` and `end_test`.
-        output_formatter = 'robot_output_formatter_verbose.py' if options.verbose else 'robot_output_formatter.py'
+        output_formatter = robot_output_formatter_verbose if options.verbose else robot_output_formatter
         listeners = [
-            os.path.join(this_path, f'retry_and_timeout_listener.py:{options.retry_count}'),
+            retry_and_timeout_listener(options.retry_count),
+            # Has to be after `retry_and_timeout_listener` to see which attempts will be retried.
+            StateDependencyListener(self.missing_state_reasons),
             # Has to be the last one to print final state, message etc. after all the changes made by other listeners.
-            os.path.join(this_path, output_formatter),
+            output_formatter,
         ]
         if options.listener:
             listeners += options.listener
@@ -1068,7 +1119,7 @@ class RobotTestSuite(object):
 
         for test in suite.tests:
             if not test.setup:
-                test.setup.config(name="Reset Emulation")
+                test.setup.config(name="Test Setup")
             if not test.teardown:
                 test.teardown.config(name="Test Teardown")
 
@@ -1082,6 +1133,9 @@ class RobotTestSuite(object):
                 if 'test:retry' in test.tags:
                     test.tags.remove('test:retry')
                 test.tags.add('test:retry(0)')
+
+            if any(tag in options.skip for tag in test.tags):
+                test.tags.add('robot:skip')
 
             # Timeout tests with `self.timeout_expected_tag` will be set as passed in the listener
             # during timeout handling. Their timeout won't be influenced by the global timeout option.
@@ -1099,7 +1153,7 @@ class RobotTestSuite(object):
         suite.parent = (self, suite.parent)
         self.timeout_handler = self._create_timeout_handler(options, iteration_index, suite_retry_index)
 
-        result = suite.run(console='none', listener=listeners, exitonfailure=options.stop_on_error, output=log_file, log=None, loglevel='TRACE', report=None, variable=variables, skiponfailure=['non_critical', 'skipped'])
+        result = suite.run(console='none', listener=listeners, exitonfailure=options.stop_on_error, output=log_file, log=None, loglevel='TRACE', report=None, variable=variables, skiponfailure=[TestTag.NON_CRITICAL, TestTag.SKIPPED, TestTag.UNSTABLE])
 
         self.suite_log_files = []
         file_name = os.path.splitext(os.path.basename(self.path))[0]
@@ -1129,7 +1183,8 @@ class RobotTestSuite(object):
                 # Tests with unexpected timeouts won't be retried.
                 self.tests_with_unexpected_timeouts = test.name
             print(f"{message_start} after {Time(test.timeout).seconds}s: {test.parent.name}.{test.name}")
-            print(f"----- Skipped flushing emulation log and saving state due to the timeout, restarting Renode...")
+            BuiltIn().run_keyword("Print Log Saved Message")
+            print(f"----- Skipped saving state due to the timeout, restarting Renode...")
 
             self._close_remote_server(RobotTestSuite.robot_frontend_process, options)
             RobotTestSuite.robot_frontend_process = self._run_remote_server(options, iteration_index, suite_retry_index)
@@ -1169,8 +1224,9 @@ class RobotTestSuite(object):
                 if not suite.get('source', False):
                     continue # it is a tag used to group other suites without meaning on its own
                 for test in suite.iter('test'):
+                    tags = [tag.text for tag in test.findall('tag') if tag.text is not None]
                     # do not check skipped tests
-                    if test.find("./tags/[tag='skipped']"):
+                    if TestTag.SKIPPED in tags:
                         continue
 
                     # only finds immediate children - required because `status`
@@ -1189,34 +1245,52 @@ class RobotTestSuite(object):
 
     @staticmethod
     def find_failed_tests(path, file="robot_output.xml"):
-        ret = {'mandatory': set(), 'non_critical': set()}
+        ret = {CRITICAL_TEST: set(), TestTag.NON_CRITICAL: set(), TestTag.UNSTABLE: set()}
 
-        # Aggregate failed tests from all report files (can be multiple if iterations or retries were used)
-        for dirpath, _, fnames in os.walk(path):
-            for fname in filter(lambda x: x == file, fnames):
-                tree = ET.parse(os.path.join(dirpath, fname))
+        report_paths = [
+            os.path.join(dirpath, fname)
+            for dirpath, _, fnames in os.walk(path)
+            for fname in fnames if fname == file
+        ]
+        # Walk retries in order so a test's last-retry verdict overwrites earlier ones,
+        # otherwise a test that failed early but passed on retry would stay failed.
+        grouped = RobotTestSuite.group_log_paths(report_paths)
+        final = {}
+        for iteration, suite_retry in sorted(grouped):
+            for report_path in grouped[(iteration, suite_retry)]:
+                tree = ET.parse(report_path)
                 root = tree.getroot()
                 for suite in root.iter('suite'):
                     if not suite.get('source', False):
                         continue # it is a tag used to group other suites without meaning on its own
                     for test in suite.iter('test'):
-                        status = test.find('status') # only finds immediate children - important requirement
-                        if status.attrib['status'] == 'FAIL':
-                            test_name = test.attrib['name']
-                            suite_name = suite.attrib['name']
-                            if suite_name == "Test Suite":
-                                # If rebot is invoked with only 1 suite, it renames that suite to Test Suite
-                                # instead of wrapping in a new top-level Test Suite. A workaround is to extract
-                                # the suite name from the *.robot file name.
-                                suite_name = os.path.basename(suite.attrib["source"]).rsplit(".", 1)[0]
-                            if test.find("./tags/[tag='skipped']"):
-                                continue # skipped test should not be classified as fail
-                            if test.find("./tags/[tag='non_critical']"):
-                                ret['non_critical'].add(f"{suite_name}.{test_name}")
-                            else:
-                                ret['mandatory'].add(f"{suite_name}.{test_name}")
+                        if RobotTestSuite._is_retried_attempt(test):
+                            continue # only the final attempt carries the test's verdict
+                        status_element = test.find('status') # only finds immediate children - important requirement
+                        status = status_element.attrib['status']
+                        test_name = test.attrib['name']
+                        suite_name = suite.attrib['name']
+                        if suite_name == "Test Suite":
+                            # If rebot is invoked with only 1 suite, it renames that suite to Test Suite
+                            # instead of wrapping in a new top-level Test Suite. A workaround is to extract
+                            # the suite name from the *.robot file name.
+                            suite_name = os.path.basename(suite.attrib["source"]).rsplit(".", 1)[0]
+                        qualified_suite_name = f"{suite_name}.{test_name}"
+                        tags = [tag.text for tag in test.findall('tag') if tag.text is not None]
+                        final[(iteration, qualified_suite_name)] = (status, tags)
 
-        if not ret['mandatory'] and not ret['non_critical']:
+        for (_, qualified_suite_name), (status, tags) in final.items():
+            if status == 'FAIL':
+                if TestTag.SKIPPED in tags:
+                    continue # skipped test should not be classified as fail
+                if TestTag.NON_CRITICAL in tags:
+                    ret[TestTag.NON_CRITICAL].add(qualified_suite_name)
+                else:
+                    ret[CRITICAL_TEST].add(qualified_suite_name)
+            elif status == "SKIP" and TestTag.UNSTABLE in tags:
+                ret[TestTag.UNSTABLE].add(qualified_suite_name)
+
+        if not ret[CRITICAL_TEST] and not ret[TestTag.NON_CRITICAL] and not ret[TestTag.UNSTABLE]:
             return None
         return ret
 
@@ -1245,7 +1319,8 @@ class RobotTestSuite(object):
                         suite_name = os.path.basename(suite.attrib["source"]).rsplit(".", 1)[0]
 
                     for test in suite.iter('test'):
-                        if test.find("./tags/[tag='skipped']"):
+                        tags = [tag.text for tag in test.findall('tag') if tag.text is not None]
+                        if TestTag.SKIPPED in tags:
                             continue  # skipped test should not be classified as fail
                         status = test.find('status')  # only finds immediate children - important requirement
                         if status.attrib["status"] == "FAIL":
@@ -1306,12 +1381,12 @@ class RobotTestSuite(object):
                     # the suite name from the *.robot file name.
                     suite_name = os.path.basename(suite.attrib["source"]).rsplit(".", 1)[0]
                 for test in suite.iter('test'):
+                    if cls._is_retried_attempt(test):
+                        continue # attempt counts are read off the final attempt's [RETRY] suffix
                     test_name = test.attrib['name']
-                    tags = []
-                    if test.find("./tags/[tag='skipped']"):
+                    tags = [tag.text for tag in test.findall('tag') if tag.text is not None]
+                    if TestTag.SKIPPED in tags:
                         continue # skipped test should not be classified as fail
-                    if test.find("./tags/[tag='non_critical']"):
-                        tags.append("non_critical")
                     status = test.find('status') # only finds immediate children - important requirement
                     m = cls.retry_test_regex.search(status.text) if status.text is not None else None
 

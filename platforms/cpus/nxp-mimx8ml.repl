@@ -168,41 +168,58 @@ wdog3: Timers.NXP_IMX_Watchdog @ sysbus 0x302A0000
 src: Miscellaneous.NXP_IMX8MP_SystemResetController @ sysbus 0x30390000
     cpus: [cpu0, cpu1, cpu2, cpu3]
 
-flexcan1: CAN.S32K3XX_FlexCAN @ sysbus 0x308C0000
+flexcan1: CAN.NXP_FlexCAN @ sysbus 0x308C0000
     IRQ -> gic@142
 
-flexcan2: CAN.S32K3XX_FlexCAN @ sysbus 0x308D0000
+flexcan2: CAN.NXP_FlexCAN @ sysbus 0x308D0000
     IRQ -> gic@144
 
-anatop: Python.PythonPeripheral @ sysbus 0x30360000
-    size: 0x1000
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
+eth_mac: Network.K6xF_Ethernet @ sysbus 0x30BE0000
+    TxIRQ -> gic@118 | gic@119 | gic@120
+    RxIRQ -> gic@118 | gic@119 | gic@120
+    MiscIRQ -> gic@120
 
-eth1: Python.PythonPeripheral @ sysbus 0x30BE0000
-    size: 0x1000
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
+eth_qos: Network.SynopsysDWCEthernetQualityOfService @ {
+        sysbus 0x30BF0000;
+        sysbus new Bus.BusMultiRegistration { address: 0x30BF0C00; size: 0x200; region: "mtl" };
+        sysbus new Bus.BusMultiRegistration { address: 0x30BF1000; size: 0x200; region: "dma" }
+    }
+    systemClockFrequency: 50000000
+    dmaBusWidth: BusWidth.Bits128
+    externalMacAddress: "10:07:23:01:02:03"
+    -> gic@135
 
-i2c1: Python.PythonPeripheral @ sysbus 0x30a20000
-    size: 0x1000
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
+i2c1: I2C.NXP_IMX_I2C @ sysbus 0x30A20000
+    IRQ -> gic@35
 
-i2c2: Python.PythonPeripheral @ sysbus 0x30a30000
-    size: 0x1000
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
+i2c2: I2C.NXP_IMX_I2C @ sysbus 0x30A30000
+    IRQ -> gic@36
 
-i2c3: Python.PythonPeripheral @ sysbus 0x30a40000
-    size: 0x1000
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
+i2c3: I2C.NXP_IMX_I2C @ sysbus 0x30A40000
+    IRQ -> gic@37
+
+i2c4: I2C.NXP_IMX_I2C @ sysbus 0x30A50000
+    IRQ -> gic@38
+
+i2c5: I2C.NXP_IMX_I2C @ sysbus 0x30AD0000
+    IRQ -> gic@76
+
+i2c6: I2C.NXP_IMX_I2C @ sysbus 0x30AE0000
+    IRQ -> gic@77
 
 apis1_gpc: Python.PythonPeripheral @ sysbus 0x303a0000
     size: 0x10000
     initable: true
     filename: "scripts/pydev/flipflop.py"
+
+ecspi1: SPI.NXP_ECSPI @ sysbus 0x30820000
+    ->gic@31
+
+ecspi2: SPI.NXP_ECSPI @ sysbus 0x30830000
+    ->gic@32
+
+ecspi3: SPI.NXP_ECSPI @ sysbus 0x30840000
+    ->gic@33
 
 sysbus:
     init add:
@@ -248,14 +265,18 @@ sysbus:
         // AIPS
         Tag <0x301F0000 0x10000> "AIPS1_Configuration"
         Tag <0x30260000 0x10000> "TMU (ANA_TSENSOR)"
-        Tag <0x30260020 0x4> "TMU_TRITSR" 0xC0200020 silent=true // Silence temperature polling
+        Tag <0x30260020 0x4> "TMU_TRITSR" 0xC0200020 silent=true       // Silence temperature polling
         Tag <0x30270000 0x10000> "ANA_OSC"
         Tag <0x30330000 0x10000> "IOMUXC"
         Tag <0x30340000 0x10000> "IOMUXC_GPR"
         Tag <0x30350000 0x10000> "OCOTP_CTRL"
-        Tag <0x30360000 0x10000> "ANA_PLL"
+        Tag <0x30360000 0x10000> "ANA_PLL" 0xFFFFFFFF
+        Tag <0x30360084 0x4> "ARM_PLL_GNRL_CTL" 0x80000A00 silent=true // PLL locked, enabled, 24M ref
+        Tag <0x30360088 0x4> "ARM_PLL_DIV_CTL" 0x000C8021 silent=true  // PLL = 1200 MHz
+        Tag <0x30360800 0x4> "DIGPROG" 0x00824311 silent=true          // SoC ID = i.MX8MP rev 1.1
         Tag <0x30370000 0x10000> "SNVS_HP"
-        Tag <0x30380000 0x10000> "CCM"
+        Tag <0x30380000 0x10000> "CCM" silent=true
+        Tag <0x30389880 0x4> "CCM_CORE_SEL" 0x01000000 silent=true     // A53 core clk = ARM_PLL
         Tag <0x303B0000 0x10000> "SEMAPHORE1"
         Tag <0x303C0000 0x10000> "SEMAPHORE2"
         Tag <0x303D0000 0x10000> "RDC"
@@ -270,26 +291,14 @@ sysbus:
         Tag <0x306C0000 0x10000> "System_Counter_CTRL"
         Tag <0x307C0000 0x10000> "PERFMON1"
         Tag <0x307D0000 0x10000> "PERFMON2"
-        Tag <0x30820000 0x10000> "eCSPI1"
-        Tag <0x30830000 0x10000> "eCSPI2"
-        Tag <0x30840000 0x10000> "eCSPI3"
-        Tag <0x308C0000 0x10000> "FlexCAN1"
-        Tag <0x308D0000 0x10000> "FlexCAN2"
         Tag <0x30900000 0x10000> "CAAM 256KB"
         Tag <0x309F0000 0x10000> "AIPS3_Configuration"
-        Tag <0x30A20000 0x10000> "I2C1"
-        Tag <0x30A30000 0x10000> "I2C2"
-        Tag <0x30A40000 0x10000> "I2C3"
-        Tag <0x30A50000 0x10000> "I2C4"
         Tag <0x30A80000 0x10000> "IRQ_STEER"
         Tag <0x30AA0000 0x10000> "MU_1_A"
         Tag <0x30AB0000 0x10000> "MU_1_B"
         Tag <0x30AC0000 0x10000> "SEMAPHORE_HS"
-        Tag <0x30AD0000 0x10000> "I2C5"
-        Tag <0x30AE0000 0x10000> "I2C6"
         Tag <0x30BB0000 0x10000> "QSPI"
         Tag <0x30BD0000 0x10000> "SDMA1"
-        Tag <0x30BE0000 0x10000> "ENET1"
         Tag <0x30C10000 0x10000> "SAI1"
         Tag <0x30C20000 0x10000> "SAI2"
         Tag <0x30C30000 0x10000> "SAI3"

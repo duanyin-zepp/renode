@@ -1,5 +1,5 @@
 nvic: IRQControllers.NVIC @ sysbus 0xE000E000
-    priorityMask: 0xF0
+    priorityMask: 0xE0
     systickFrequency: 1000000
     IRQ -> cpu@0
 
@@ -111,6 +111,7 @@ dma2: DMA.STM32LDMA @ sysbus 0x40020400
     [0-7] -> nvic@[80-87]
 
 dmamux: Miscellaneous.STM32_DMAMUX @ sysbus 0x40020800
+    numberOfInputRequestChannels: 94
     numberOfOutputRequestChannels: 16
     numberOfRequestGeneratorChannels: 4
     [0-7] -> dma1@[0-7]
@@ -285,27 +286,11 @@ gpioPortF:
 sysbus:
     init:
         ApplySVD @https://dl.antmicro.com/projects/renode/svd/STM32L552.svd
-        // Hard set all oscillator RDY bits
-        Tag <0x40021000 4> "RCC_CR" 0x2A020402
-
-        // Hard set HSI16 oscillator as system clock
-        Tag <0x40021008 4> "RCC_CFGR" 0x4
 
         Tag <0x40007000 0x400> "PWR"
         Tag <0xE0001000 0xffb> "DWT"
 
-rcc: Python.PythonPeripheral @ sysbus 0x40021000
-    size: 0x400
-    initable: true
-    script: '''
-if request.IsInit:
-    lastVal = 0
-else:
-    lastVal = 1 - lastVal
-    request.Value = lastVal * 0xFFFFFFFF
-    if request.Offset == 0x0:
-        request.Value = request.Value | (1 << 17)
-'''
+rcc: Miscellaneous.STM32L5_RCC @ sysbus 0x40021000
 
 flashController: MTD.STM32WBA_FlashController @ sysbus 0x40022000
     flash: flash

@@ -1,17 +1,19 @@
 # pylint: disable=C0301,C0103,C0111
 from sys import platform
+from argparse import Namespace
 from platform import machine
 import os
 import signal
 import psutil
 import subprocess
 from time import monotonic
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import xml.etree.ElementTree as ET
 import glob
 
-from tests_engine import TestResult
+from tests_engine import TestResult, CRITICAL_TEST
+from unstable_tests import KnownUnstableSuite
 
 
 THIS_PATH = os.path.abspath(os.path.dirname(__file__))
@@ -25,6 +27,7 @@ class NUnitTestSuite(object):
 
     def __init__(self, path):
         self.path = path
+        self.known_unstable: Optional[KnownUnstableSuite] = None
 
     def check(self, options, number_of_runs): # API requires this method
         pass
@@ -33,6 +36,12 @@ class NUnitTestSuite(object):
         # Unused mechanism, this exists to keep a uniform interface with
         # robot_tests_provider.py.
         return options.results_directory
+
+    def select_tests(self, options: Namespace) -> bool:
+        """Select tests and return whether the suite should remain scheduled."""
+        # NUnit applies filters when running the compiled assembly, so we cannot
+        # rule out any tests here. Keep the suite scheduled for NUnit to decide.
+        return True
 
     def prepare(self, options):
         if not options.skip_building:
@@ -58,6 +67,9 @@ class NUnitTestSuite(object):
                     os.kill(proc.info['pid'], signal.SIGTERM)
 
     def run(self, options, iteration_index=1, suite_retry_index=0):
+        if self.known_unstable:
+            raise Exception("NUnit tests are not yet supported in the --unstable feature.")
+
         # The iteration_index and suite_retry_index arguments are not implemented.
         # They exist for the sake of a uniform interface with robot_tests_provider.
         print('Running ' + self.path)
@@ -115,7 +127,7 @@ class NUnitTestSuite(object):
     @staticmethod
     def find_failed_tests(path, files_pattern='*.csproj.xml'):
         test_files = glob.glob(os.path.join(path, files_pattern))
-        ret = {'mandatory': []}
+        ret = {CRITICAL_TEST: []}
         for test_file in test_files:
             tree = ET.parse(test_file)
             root = tree.getroot()
@@ -123,9 +135,9 @@ class NUnitTestSuite(object):
             xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"
             for test in root.iter(f"{{{xmlns}}}UnitTestResult"):
                 if test.attrib['outcome'] == 'Failed':
-                    ret['mandatory'].append(test.attrib['testName'])
+                    ret[CRITICAL_TEST].append(test.attrib['testName'])
 
-        if not ret['mandatory']:
+        if not ret[CRITICAL_TEST]:
             return None
         return ret
 

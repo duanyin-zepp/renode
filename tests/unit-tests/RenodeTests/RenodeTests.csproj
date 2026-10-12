@@ -1,13 +1,12 @@
 <Project DefaultTargets="Build" Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks Condition="$(OS) != 'Windows_NT'">net6.0</TargetFrameworks>
-    <TargetFrameworks Condition="$(OS) == 'Windows_NT'">net6.0-windows10.0.17763.0</TargetFrameworks>
+    <TargetFrameworks>net6.0</TargetFrameworks>
     <RollForward>Major</RollForward>
     <AssemblyName>RenodeTests</AssemblyName>
-    <PropertiesLocation>..\..\..\output\properties.csproj</PropertiesLocation>
+    <OutputPath>..\..\..\output\bin\$(Configuration)</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <LangVersion>12.0</LangVersion>
   </PropertyGroup>
-  <Import Project="$(PropertiesLocation)" />
   <ItemGroup>
     <PackageReference Include="NUnit" Version="3.13.1" />
     <PackageReference Include="NUnit3TestAdapter" Version="3.17.0" />

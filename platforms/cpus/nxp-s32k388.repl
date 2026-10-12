@@ -210,21 +210,17 @@ stm3: Timers.S32K3XX_SystemTimerModule @ sysbus 0x4047C000
     -> mscm@57
 
 pit0: Timers.S32K3XX_PeriodicInterruptTimer @ sysbus 0x400B0000
-    oscillatorFrequency: 12_000_000
     hasRealTimeInterrupt: true
     hasLifetimeTimer: true
     -> mscm@96
 
 pit1: Timers.S32K3XX_PeriodicInterruptTimer @ sysbus 0x400B4000
-    oscillatorFrequency: 12_000_000
     -> mscm@97
 
 pit2: Timers.S32K3XX_PeriodicInterruptTimer @ sysbus 0x402FC000
-    oscillatorFrequency: 12_000_000
     -> mscm@98
 
 pit3: Timers.S32K3XX_PeriodicInterruptTimer @ sysbus 0x40300000
-    oscillatorFrequency: 12_000_000
     -> mscm@99
 
 rtc: Timers.S32K3XX_RealTimeClock @ sysbus 0x40288000
@@ -356,127 +352,27 @@ lpuart15: UART.NXP_LPUART @ sysbus 0x404A8000
     IRQ -> mscm@156
     [TransmitDMA, ReceiveDMA] -> dma_mux1@[48-49]
 
-can0: CAN.S32K3XX_FlexCAN @ { sysbus 0x40304000; xrdc [1, 193] }
+can0: CAN.NXP_FlexCAN @ { sysbus 0x40304000; xrdc [1, 193] }
     numberOfMessageBuffers: 96
     enhancedRxFifoSize: 20
 
-can1: CAN.S32K3XX_FlexCAN @ { sysbus 0x40308000; xrdc [1, 194] }
+can1: CAN.NXP_FlexCAN @ { sysbus 0x40308000; xrdc [1, 194] }
     numberOfMessageBuffers: 96
     enhancedRxFifoSize: 20
 
-can2: CAN.S32K3XX_FlexCAN @ { sysbus 0x4030C000; xrdc [1, 195] }
+can2: CAN.NXP_FlexCAN @ { sysbus 0x4030C000; xrdc [1, 195] }
     numberOfMessageBuffers: 96
     enhancedRxFifoSize: 20
 
-can3: CAN.S32K3XX_FlexCAN @ { sysbus 0x40310000; xrdc [1, 196] }
+can3: CAN.NXP_FlexCAN @ { sysbus 0x40310000; xrdc [1, 196] }
 
-can4: CAN.S32K3XX_FlexCAN @ { sysbus 0x40314000; xrdc [1, 197] }
+can4: CAN.NXP_FlexCAN @ { sysbus 0x40314000; xrdc [1, 197] }
 
-can5: CAN.S32K3XX_FlexCAN @ { sysbus 0x40318000; xrdc [1, 198] }
+can5: CAN.NXP_FlexCAN @ { sysbus 0x40318000; xrdc [1, 198] }
 
-can6: CAN.S32K3XX_FlexCAN @ { sysbus 0x4031C000; xrdc [1, 199] }
+can6: CAN.NXP_FlexCAN @ { sysbus 0x4031C000; xrdc [1, 199] }
 
-can7: CAN.S32K3XX_FlexCAN @ { sysbus 0x40320000; xrdc [1, 200] }
-
-mc_cgm_mux_0_css: Python.PythonPeripheral @ sysbus 0x402D8304
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_1_css: Python.PythonPeripheral @ sysbus 0x402D8344
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_2_css: Python.PythonPeripheral @ sysbus 0x402D8384
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_3_css: Python.PythonPeripheral @ sysbus 0x402D83C4
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_4_css: Python.PythonPeripheral @ sysbus 0x402D8404
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_5_css: Python.PythonPeripheral @ sysbus 0x402D8444
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_6_css: Python.PythonPeripheral @ sysbus 0x402D8484
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_7_css: Python.PythonPeripheral @ sysbus 0x402D84C4
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_8_css: Python.PythonPeripheral @ sysbus 0x402D8504
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_9_css: Python.PythonPeripheral @ sysbus 0x402D8544
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_10_css: Python.PythonPeripheral @ sysbus 0x402D8584
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_11_css: Python.PythonPeripheral @ sysbus 0x402D85C4
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_12_css: Python.PythonPeripheral @ sysbus 0x402D8604
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_13_css: Python.PythonPeripheral @ sysbus 0x402D8644
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_14_css: Python.PythonPeripheral @ sysbus 0x402D8684
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_15_css: Python.PythonPeripheral @ sysbus 0x402D86C4
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_16_css: Python.PythonPeripheral @ sysbus 0x402D8704
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_17_css: Python.PythonPeripheral @ sysbus 0x402D8744
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_18_css: Python.PythonPeripheral @ sysbus 0x402D8784
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
-
-mc_cgm_mux_19_css: Python.PythonPeripheral @ sysbus 0x402D87C4
-    size: 0x4
-    initable: true
-    filename: "scripts/pydev/flipflop.py"
+can7: CAN.NXP_FlexCAN @ { sysbus 0x40320000; xrdc [1, 200] }
 
 gmac0: Network.S32K3XX_GMAC @ sysbus 0x40484000
     systemClockFrequency: 50000000
@@ -556,6 +452,13 @@ emios2: GPIOPort.S32K3XX_eMIOS @ sysbus 0x40090000
     [40-43] -> mscm@[78,78,78,78]
     [44-47] -> mscm@[77,77,77,77]
 
+mc_cgm: Miscellaneous.S32K3XX_MC_CGM @ sysbus 0x402D8000
+    coreClk: [emios0, emios1, emios2]
+    aipsSlowClk: [pit0, pit1, pit2, pit3]
+
+plldig: Miscellaneous.S32K3XX_PLLDIG @ sysbus 0x402E0000
+    clockGenerationModule: mc_cgm
+
 sysbus:
     init:
         // Core and Systems
@@ -586,12 +489,10 @@ sysbus:
         Tag <0x40468000 0x4> "PRAMC_2"
 
         // Clocking
-        Tag <0x402D8000 0x800> "MC_CGM"
         Tag <0x402D0000 0xC> "FIRC"
         Tag <0x402C8000 0x10> "SIRC"
         Tag <0x402D4000 0x8> "FXOSC"
         Tag <0x402CC000 0x8> "SXOSC"
-        Tag <0x402E0000 0x88> "PLL"
         Tag <0x402E4000 0x88> "PLL_AUX"
 
         // Reset and Boot
@@ -663,6 +564,5 @@ sysbus:
         // Mocks
         Tag <0x402D4004 0x4> "Oscillator Status Register (STAT)" 0x80000000 silent=true
         Tag <0x402CC004 0x4> "Oscillator Status Register (SXOSC_STAT)" 0x80000000 silent=true
-        Tag <0x402E0004 0x4> "PLL Status Register (PLLSR)" 0x4
         Tag <0x402E4004 0x4> "PLL Status Register (PLLSR)" 0x4
         Tag <0x402D0004 0x4> "STATUS" 0x1 silent=true

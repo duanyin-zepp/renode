@@ -6,14 +6,23 @@
 //
 #pragma once
 
+#include <systemc>
+#include <atomic>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 
+#include <chrono>
 #include <mutex>
 #include <queue>
+#include <map>
 #include <tlm>
-#include <tlm_utils/simple_initiator_socket.h>
-#include <tlm_utils/simple_target_socket.h>
+
+#define _RENODE_BRIDGE_H
 
 struct CTCPClient;
 struct renode_message;
@@ -22,6 +31,7 @@ struct renode_message;
 #define RENODE_BUSWIDTH 32
 #endif
 
+// NUM_GPIO must be equal to SystemCPeripheral.cs:NumberOfGPIOPins
 #define NUM_GPIO 1024
 #define NUM_DIRECT_CONNECTIONS 4
 
@@ -33,23 +43,22 @@ struct renode_message;
 // Backward socket: Request from SystemC, Response From Renode
 
 enum renode_action : uint8_t {
-  // Socket: forward only
-  // Init message received for the second time signifies Renode terminated and
-  // the process should exit. Request:
+  // Socket: backward
+  // Request:
   //     data_length: ignored
   //     address: ignored
   //     connection_index: ignored
+  // Response:
   //     payload: time synchronization granularity in us
   //       TIMESYNC messages will be sent with this period. This does NOT
   //       guarantee that the processes will never desynchronize by more than
   //       this amount.
-  // Response:
-  //      Identical to the request message.
+  //      Otherwise identical to the request message.
   INIT = 0,
 
   // Socket: forward, backward
   // Request:
-  //     data_length: number of bytes to read [1, 8]
+  //     data_length: 0-3 LSB: number of bytes to read [1, 8]. 4-7 LSB: extension bits
   //     address: address to read from, in target's address space
   //     payload: ignored
   //     connection_index: 0 for SystemBus, [1, NUM_DIRECT_CONNECTIONS]
@@ -58,12 +67,13 @@ enum renode_action : uint8_t {
   //     address: duration of transaction in us
   //     payload: read value
   //     connection_index: 0=DMI unsupported, 1=DMI supported
+  //     data_length: transaction response status
   //     Otherwise identical to the request message.
   READ = 1,
 
   // Socket: forward, backward
   // Request:
-  //     data_length: number of bytes to write [1, 8].
+  //     data_length: 0-3 LSB: number of bytes to write [1, 8]. 4-7 LSB: extension bits
   //     address: address to write to, in target's address space
   //     payload: value to write
   //     connection_index: 0 for SystemBus, [1, NUM_DIRECT_CONNECTIONS] for
@@ -71,6 +81,7 @@ enum renode_action : uint8_t {
   // Response:
   //     address: duration of transaction in us
   //     connection_index: 0=DMI unsupported, 1=DMI supported
+  //     data_length: transaction response status
   //     Otherwise identical to the request message.
   WRITE = 2,
 
@@ -107,8 +118,8 @@ enum renode_action : uint8_t {
   // Socket: backward (memory mapped file), forward (native integration)
   // Request:
   //     data_length:
-  //       backward: ignored 
-  //       forward: access type (read access = 0, write access = 1)
+  //       backward: ignored
+  //       forward: 0-3 LSB: access type (read access = 0, write access = 1). 4-7 LSB: extension bits
   //     address: address in target's address space
   //     payload: ignored
   //     to write connection_index: 0 for SystemBus
@@ -128,7 +139,7 @@ enum renode_action : uint8_t {
 
   // Socket: forward only
   // Request:
-  //     data_length: number of bytes to read [1, 8]
+  //     data_length: 0-3 LSB: number of bytes to read [1, 8]. 4-7 LSB: extension bits
   //     address: register to read from, in target's register space
   //     payload: value to write
   //     connection_index: 0 for SystemBus, [1, NUM_DIRECT_CONNECTIONS]
@@ -136,18 +147,20 @@ enum renode_action : uint8_t {
   // Response:
   //     address: duration of transaction in us
   //     payload: read value
+  //     data_length: transaction response status
   //     Otherwise identical to the request message.
   READ_REGISTER = 8,
 
   // Socket: forward only
   // Request:
-  //     data_length: number of bytes to write [1, 8].
+  //     data_length: 0-3 LSB: number of bytes to write [1, 8]. 4-7 LSB: extension bits
   //     address: register to write to, in target's register space
   //     payload: value to write
   //     connection_index: 0 for SystemBus, [1, NUM_DIRECT_CONNECTIONS] for
   //       direct connection
   // Response:
   //     address: duration of transaction in us
+  //     data_length: transaction response status
   //     Otherwise identical to the request message.
   WRITE_REGISTER = 9,
 
@@ -170,7 +183,7 @@ enum renode_action : uint8_t {
   // Response:
   //     Identical to the request message.
   INIT_NON_SECURE_VTOR = 11,
-  
+
   // Socket: backward
   // Request:
   //     data_length: ignored
@@ -180,6 +193,48 @@ enum renode_action : uint8_t {
   // Response:
   //     Identical to the request message.
   INVALIDATE_DMI_RANGE = 12,
+
+  // Socket: forward only
+  // Request:
+  //     data_length: 0-3 LSB: number of bytes to read [1, 8]. 4-7 LSB: extension bits
+  //     address: register to read from, in target's register space
+  //     connection_index: 0 for SystemBus
+  // Response:
+  //     address: the number of read bytes
+  //     payload: read value
+  //     Otherwise identical to the request message.
+  READ_DEBUG = 13,
+
+  // Socket: forward only
+  // Request:
+  //     data_length: 0-3 LSB: number of bytes to write [1, 8]. 4-7 LSB: extension bits
+  //     address: register to write to, in target's register space
+  //     payload: value to write
+  //     connection_index: 0 for SystemBus
+  // Response:
+  //     address: the number of written bytes
+  //     Otherwise identical to the request message.
+  WRITE_DEBUG = 14,
+
+  // Socket: forward
+  // Teardown message signifies the process should exit.
+  // Request:
+  //     data_length: ignored
+  //     address: ignored
+  //     connection_index: ignored
+  // Response:
+  //      Identical to the request message.
+  TEARDOWN = 15,
+
+  // Socket: backward only
+  // Request:
+  //     data_length: ignored
+  //     connection_index: ignored
+  //     address: clock frequency
+  //     payload: ignored
+  // Response:
+  //     Identical to the request message.
+  SET_CLOCK_FREQUENCY = 16,
 };
 
 #pragma pack(push, 1)
@@ -190,6 +245,7 @@ struct renode_message {
   renode_action action;
   uint8_t data_length;
   uint8_t connection_index;
+  uint32_t initiator_id;
   uint64_t address;
   uint64_t payload;
 };
@@ -220,6 +276,24 @@ struct dmi_native_message {
 };
 #pragma pack(pop)
 
+class RenodeExt : public tlm::tlm_extension<RenodeExt> {
+public:
+    bool secure;
+    bool privileged;
+
+    RenodeExt() : secure(0), privileged(0) {}
+
+    virtual tlm::tlm_extension_base* clone() const override {
+        return new RenodeExt(*this);
+    }
+
+    virtual void copy_from(tlm::tlm_extension_base const &ext) override {
+        const RenodeExt& that = static_cast<const RenodeExt&>(ext);
+        this->secure = that.secure;
+        this->privileged = that.privileged;
+    }
+};
+
 template <typename T>
 class BlockingCollection
 {
@@ -239,15 +313,137 @@ public:
       if (wake) condvar_.notify_one();
     }
 
-    T take() {
+    // do_yield == true can only be used from an SC_THREAD
+    T take(bool do_yield = false, std::chrono::milliseconds timeout_duration = std::chrono::milliseconds(20)) {
       ulock u(mutex_);
-      while (queue_.empty())
-        condvar_.wait(u);
+      while (queue_.empty()) {
+        if(do_yield) {
+          if(condvar_.wait_for(u, timeout_duration) == std::cv_status::timeout) {
+            sc_core::wait(sc_core::SC_ZERO_TIME);
+          }
+        }
+        else {
+          condvar_.wait(u);
+        }
+      }
       // queue_ is non-empty and we have the lock
       T retval = queue_.front();
       queue_.pop();
       return retval;
     }
+};
+
+// Single producer/single consumer notification for the native mailbox.
+// Spin briefly to avoid an OS context switch on repeated transactions,
+// then block. Waiting state closes the check/sleep race with signal().
+class native_event {
+public:
+  void signal() {
+    if(state_.exchange(Ready) == Waiting) {
+      lock l(mutex_);
+      condvar_.notify_one();
+    }
+  }
+
+  // A timeout lets forward_loop yield a SystemC delta cycle while idle.
+  bool wait(uint32_t spin_iterations, std::chrono::milliseconds timeout_duration = std::chrono::milliseconds(20)) {
+    for(unsigned i = 0; i < spin_iterations; ++i) {
+      if(state_.load() == Ready) {
+        return true;
+      }
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+      _mm_pause();
+#elif defined(__i386__) || defined(__x86_64__)
+      __builtin_ia32_pause();
+#elif defined(__aarch64__)
+      asm volatile("yield");
+#endif
+    }
+
+    ulock u(mutex_);
+    auto expected = Empty;
+    if(!state_.compare_exchange_strong(expected, Waiting)) {
+      return true;
+    }
+    condvar_.wait_for(u, timeout_duration, [this] {
+      return state_.load() == Ready;
+    });
+    expected = Waiting;
+    return !state_.compare_exchange_strong(expected, Empty);
+  }
+
+  // Only the consumer resets a notification, after observing Ready. The
+  // rendezvous prevents the producer from publishing another time first
+  void reset() {
+    state_.store(Empty);
+  }
+
+private:
+  typedef std::lock_guard<std::mutex> lock;
+  typedef std::unique_lock<std::mutex> ulock;
+
+  enum State {
+    Empty,
+    Waiting,
+    Ready
+  };
+
+  std::atomic<State> state_{Empty};
+  std::mutex mutex_;
+  std::condition_variable condvar_;
+};
+
+class renode_connection;
+class renode_bridge;
+
+// ================================================================================
+// renode_connection
+//
+//   SystemC module that establishes and manages a connection with Renode.
+// ================================================================================
+
+class renode_connection : sc_core::sc_module {
+public:
+  renode_connection(sc_core::sc_module_name name, const char *address,
+                const char *port, bool native = false, std::string mach = "", std::string peri = "", bool hosted = false);
+  ~renode_connection();
+
+  void register_bridge(uint32_t id, renode_bridge *bridge);
+  void handle_backward_response_from_native(renode_message message);
+  void handle_backward_response_dmi_from_native(dmi_message message);
+  bool handle_forward_request_from_native(renode_message message, renode_message *response, dmi_native_message *dmi_response);
+  renode_message receive_backward_response();
+  dmi_message receive_backward_response_dmi();
+  renode_message receive_forward_request(bool *closed);
+  void send_backward_request(renode_message *message);
+  void send_forward_response(renode_message *message);
+  void send_forward_response_dmi(dmi_native_message *message);
+private:
+  bool initialize_connection(int64_t *out_max_desync_us);
+  void forward_loop();
+
+  // Connection from Renode -> SystemC.
+  std::unique_ptr<CTCPClient> forward_connection;
+
+  // Connection from SystemC -> Renode
+  std::unique_ptr<CTCPClient> backward_connection;
+
+  int64_t max_desync_us;
+  bool native;
+  uint32_t spin_wait_iterations;
+  std::string mach;
+  std::string peri;
+
+  native_event native_response_event;
+  native_event native_request_event;
+  renode_message native_request;
+  renode_message *native_response;
+  dmi_native_message *native_dmi_response;
+
+  BlockingCollection<renode_message> bw_response;
+  BlockingCollection<dmi_message> dmi_response;
+
+  std::map<uint32_t, renode_bridge*> bridges;
 };
 
 // ================================================================================
@@ -259,15 +455,11 @@ public:
 class renode_bridge : sc_core::sc_module {
 public:
   renode_bridge(sc_core::sc_module_name name, const char *address,
-                const char *port, bool native = false, std::string mach = "", std::string peri = "");
+                const char *port, bool native = false, std::string mach = "", std::string peri = "",
+                uint32_t id = 0, bool hosted = false, renode_connection *conn = NULL);
   ~renode_bridge();
-
-  // Returns true if connection with Renode has been established, false otherwise.
-  bool is_initialized() { return fw_connection_initialized; }
-
-  void handle_backward_response_from_native(renode_message message);
-  void handle_backward_response_dmi_from_native(dmi_message message);
-  void handle_forward_request_from_native(renode_message message);
+  void handle_forward_request(renode_message &message);
+  void register_connection(renode_connection *conn);
 public:
   using renode_bus_target_socket =
       tlm::tlm_target_socket<RENODE_BUSWIDTH, tlm::tlm_base_protocol_types, 1,
@@ -283,7 +475,8 @@ public:
                                       sc_core::SC_ZERO_OR_MORE_BOUND>;
   using vtor_in_port = sc_core::sc_port<sc_core::sc_signal_in_if<uint32_t>, 1,
                                       sc_core::SC_ZERO_OR_MORE_BOUND>;
-
+  using clock_period_in_port = sc_core::sc_port<sc_core::sc_signal_in_if<sc_core::sc_time>, 1,
+                                      sc_core::SC_ZERO_OR_MORE_BOUND>;
 
   // Socket forwarding memory transactions performed in Renode to SystemC.
   renode_bus_initiator_socket initiator_socket;
@@ -320,6 +513,9 @@ public:
   // INITSVTOR signal.
   // Vector table offset address (secure or non-secure depending on state)
   vtor_in_port init_vtor_s_in;
+  
+  // Clock's period
+  clock_period_in_port clock_period_in;
 
   // Informs Renode CPU that memory has been modified in the given range. This
   // is necessary when using DMI (get_direct_mem_ptr) to modify memory
@@ -372,21 +568,22 @@ private:
     uint8_t connection_idx;
   };
 
-  bool initialize_connection(renode_message *message, int64_t *out_max_desync_us);
-  void forward_loop();
   renode_message receive_backward_response();
   dmi_message receive_backward_response_dmi();
-  renode_message receive_forward_request(bool *closed);
   void send_backward_request(renode_message *message);
   void send_forward_response(renode_message *message);
   void send_forward_response_dmi(dmi_native_message *message);
+
   void handle_get_direct_mem_ptr(renode_bus_initiator_socket &socket, renode_message &message);
+  void handle_debug_access(renode_message &message);
   void handle_read(renode_bus_initiator_socket &socket, renode_message &message, uint8_t data[8]);
   void handle_write(renode_bus_initiator_socket &socket, renode_message &message, uint8_t data[8]);
+  void sync_gpio_state(bool init);
   void on_port_gpio();
   void on_init_ns_vtor();
   void on_init_s_vtor();
   void init_vtor(renode_action action, vtor_in_port &port);
+  void on_set_clock_period();
 
   void update_backward_gpio_state(uint64_t new_gpio_state);
   void service_backward_request(tlm::tlm_generic_payload &payload,
@@ -394,19 +591,14 @@ private:
                                 sc_core::sc_time &delay);
   bool service_backward_request_dmi(tlm::tlm_generic_payload &payload,
                                     tlm::tlm_dmi &dmi_data);
-  int64_t get_systemc_time_us();
-
-  // Connection from Renode -> SystemC.
-  std::unique_ptr<CTCPClient> forward_connection;
-
-  // Connection from SystemC -> Renode
-  std::unique_ptr<CTCPClient> backward_connection;
 
   // Construction/destruction of tlm_generic_payload is an expensive operation,
   // so a single tlm_generic_payload object is reused, as recommended by OSCI
   // TLM-2.0 Language Reference Manual. It also requires that the object is
   // allocated on the heap.
   std::unique_ptr<tlm::tlm_generic_payload> payload;
+
+  std::unique_ptr<RenodeExt> ext;
 
   initiator_bw_handler bus_initiator_bw_handler;
   initiator_bw_handler cpu_initiator_bw_handler;
@@ -416,14 +608,8 @@ private:
   initiator_bw_handler dc_initiators[NUM_DIRECT_CONNECTIONS];
   target_fw_handler dc_targets[NUM_DIRECT_CONNECTIONS];
 
-  bool fw_connection_initialized;
-  bool native;
-  std::string mach;
-  std::string peri;
-
-  BlockingCollection<renode_message> bw_response;
-  BlockingCollection<dmi_message> dmi_response;
-  BlockingCollection<renode_message> fw_request;
+  renode_connection *conn;
+  uint32_t id;
 };
 
 // ================================================================================

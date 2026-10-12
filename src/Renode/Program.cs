@@ -7,8 +7,10 @@
 using System;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.RobotFramework;
 using Antmicro.Renode.UI;
@@ -22,6 +24,16 @@ namespace Antmicro.Renode
         public static void Main(string[] args)
         {
             AppDomain.CurrentDomain.ProcessExit += (_, __) => Emulator.Exit();
+
+            void SignalHandler(PosixSignalContext ctx)
+            {
+                ctx.Cancel = true;
+                Emulator.Exit();
+            }
+            var signal = RuntimeInfo.IsWindows() ? PosixSignal.SIGQUIT : PosixSignal.SIGINT;
+            using var signalHandler = PosixSignalRegistration.Create(signal, SignalHandler);
+            using var sigtermHandler = PosixSignalRegistration.Create(PosixSignal.SIGTERM, SignalHandler);
+            using var sighupHandler = PosixSignalRegistration.Create(PosixSignal.SIGHUP, SignalHandler);
 
             var options = new Options();
             var optionsParser = new OptionsParser.OptionsParser();
@@ -127,7 +139,7 @@ namespace Antmicro.Renode
                 try
                 {
                     var name = entryAssembly == null ? "Unknown assembly name" : entryAssembly.GetName().Name;
-                    var version = entryAssembly == null ? ": Unknown version" : entryAssembly.GetName().Version.ToString();
+                    var version = entryAssembly == null ? ": Unknown version" : entryAssembly.GetName().Version.ToString(3);
                     return string.Format("{0} v{1}\n  build: {2}\n  build type: {3}\n  runtime: .NET {4}",
                         name,
                         version,

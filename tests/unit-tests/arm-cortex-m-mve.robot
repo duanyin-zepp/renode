@@ -1289,6 +1289,8 @@ LOB LE Should Raise Exception
     Create Machine
     # We add 1 to the interrupt address in the vector table to signify we're still in Thumb state. It is required on Armv8-M.
     Execute Command                 sysbus WriteDoubleWord 0x18 ${interrupt_address+1}
+    # We write to System Handler Control and State Register to enable UsageFault interrupts, so on exception we end up in UsageFault handler and not HardFault handler
+    Execute Command                 sysbus WriteDoubleWord 0xE000ED24 0xF0000
     Execute Command                 cpu SetRegister "R0" 3
 
     Load Program And Execute        ${assembly}  ${interrupt_address}
@@ -1427,3 +1429,20 @@ VSHLC Should Produce Correct Results
 
     Register Q4 Should Contain 0xb4b4ab4b 4b4b54b4 b4b4ab4b 4b4b401f  message=VSHLC with input ${input_q4}, shift: 13 bits, carry: 0x1f\n
     Register Should Be Equal        r4  0x000014b4
+
+Should Execute MOV.W With SP Instead of Wide Shift Instruction
+    # When testing it's important to remember that [1:0] bits of SP are RES0H
+    ${initial_sp}=                  Set Variable  0xFEEDC0D0
+    ${final_sp}=                    Set Variable  0xBADCAFF0
+
+    Create Machine
+    Execute Command                 cpu SetRegister "sp" ${initial_sp}
+    Execute Command                 cpu SetRegister "r1" ${final_sp}
+
+    ${assembly}=                    Catenate  SEPARATOR=\n
+    ...                             mov.w r0, sp
+    ...                             mov.w sp, r1
+    Load Program And Execute        ${assembly}
+
+    Register Should Be Equal        r0  ${initial_sp}
+    Register Should Be Equal        sp  ${final_sp}

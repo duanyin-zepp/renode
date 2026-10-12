@@ -6,9 +6,11 @@ set -u
 cd "${0%/*}"
 . common_make_packages.sh
 
-RENODE_OUTPUT_DIR=$BASE/output/bin/$TARGET/$RID
-RENODE_OUTPUT_BINARY=$RENODE_OUTPUT_DIR/publish/Renode
-DESTINATION=renode_${VERSION}-dotnet_portable
+RENODE_PUBLISH=$BASE/output/publish/$TARGET/$RID
+HEADLESS_SUFFIX=""
+if $HEADLESS; then
+    HEADLESS_SUFFIX="-headless"
+fi
 
 # create MacOS app structure
 MACOS_APP_DIR=Renode.app
@@ -21,19 +23,14 @@ DIR=$MACOS_APP_DIR/Contents/MacOS
 
 OS_NAME=macos
 
-function sed_inplace() {
-    sed -i '' "$@"
-}
-
 . common_copy_files_portable.sh
 
-cp $RENODE_OUTPUT_BINARY $DIR/renode
-cp $RENODE_OUTPUT_DIR/*.dylib $DIR
-cp $RENODE_OUTPUT_DIR/../libllvm-disas.dylib $DIR
+copy_publish_output $DIR
+mv $DIR/Renode $DIR/renode
 
 chmod +x $DIR/renode
 
-sed_inplace '/run_tests.py/s/$/ --exclude "skip_portable"/' "$DIR/renode-test"
+sed_inplace '/run_tests.py/s/$/ --exclude "exclude_portable"/' "$DIR/renode-test"
 
 cp macos/macos_run.sh $MACOS_APP_DIR/Contents/MacOS
 cp macos/Info.plist $MACOS_APP_DIR/Contents/Info.plist
@@ -45,7 +42,7 @@ OUTPUT=$BASE/$PACKAGES
 
 # Create dmg file
 mkdir -p $OUTPUT
-hdiutil create -volname Renode_$VERSION -srcfolder $MACOS_APP_DIR -ov -format UDZO $OUTPUT/renode-$VERSION.$RID-portable.dmg
+hdiutil create -volname Renode_$VERSION -srcfolder $MACOS_APP_DIR -ov -format UDZO $OUTPUT/renode-$VERSION.$RID-portable${HEADLESS_SUFFIX}.dmg
 
 # Cleanup
 rm -rf $MACOS_APP_DIR

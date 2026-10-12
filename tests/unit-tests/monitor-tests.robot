@@ -216,13 +216,37 @@ Should Run SetAndRevertAfter With Multiple Targets
     Property Equals     adc ReferenceVoltage  5
     Property Equals     adc Temperature  13
 
+Should Serialize SetAndRevertAfter While Command Is Running
+    ${file}=            Allocate Temporary File
+
+    Execute Command     i @scripts/single-node/sam4s.resc
+    Execute Command     adc ReferenceVoltage 5
+
+    Execute Command     setAndRevertAfter 0.1 adc ReferenceVoltage 3.1
+
+    # Create snapshot in the midddle of SARA command
+    Execute Command     emulation RunFor "0.05"
+    Property Equals     adc ReferenceVoltage  3.1
+
+    Provides            SARA-saved-mid-run
+
+Should Deserialize SetAndRevertAfter Running Command
+    Requires            SARA-saved-mid-run
+
+    Execute Command     mach set 0
+    Property Equals     adc ReferenceVoltage  3.1
+
+    # Loaded SARA should revert after time passed
+    Execute Command     emulation RunFor "0.05"
+    Property Equals     adc ReferenceVoltage  5
+
 Should Find Unix-only Method on Unix
-    [Tags]              skip_windows
+    [Tags]              exclude_windows
     ${file}=            Allocate Temporary File
     Execute Command     emulation CreateUartPtyTerminal "abc" "${file}" forceCreate=true
 
 Should Fail to Find Unix-only Method on Windows
-    [Tags]                        skip_osx  skip_linux
+    [Tags]                        exclude_osx  exclude_linux
     ${file}=                      Allocate Temporary File
     Run Keyword And Expect Error  *does not provide a field, method or property CreateUartPtyTerminal*
     ...   Execute Command  emulation CreateUartPtyTerminal "abc" "${file}" forceCreate=true

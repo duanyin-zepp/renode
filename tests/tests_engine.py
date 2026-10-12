@@ -10,8 +10,10 @@ import yaml
 import multiprocessing
 from typing import Any
 from pathlib import Path
+from enum import Enum
 import segmenting
 import monitoring
+import unstable_tests
 
 this_path = os.path.abspath(os.path.dirname(__file__))
 registered_handlers = []
@@ -19,7 +21,22 @@ TestResult = namedtuple('TestResult', ('ok', 'log_file'))
 shared_suite_counter = None
 shared_active_suites = None
 
-DEFAULT_RENODE_BINARY_NAME = 'Renode.dll'
+DEFAULT_RENODE_BINARY_NAME = 'Renode.dll' if platform != 'win32' else 'RenodeWPF.dll'
+# Not a TestTag because it's not a real tag, it's the default.
+CRITICAL_TEST = 'mandatory'
+
+class TestTag(str, Enum):
+    SKIPPED = "skipped"
+    NON_CRITICAL = "non_critical"
+    UNSTABLE = "unstable"
+    RETRIED_ATTEMPT = "retried_attempt"
+
+    def __str__(self):
+        return self.value
+
+    def __format__(self, format_spec):
+        return format(self.value, format_spec)
+
 
 class IncludeLoader(yaml.SafeLoader):
 
@@ -138,9 +155,14 @@ def prepare_parser():
                         help="Run only tests marked with a tag.")
 
     parser.add_argument("--exclude",
-                        default=['skipped'],
+                        default=['excluded'],
                         action="append",
                         help="Do not run tests marked with a tag.")
+
+    parser.add_argument("--skip",
+                        default=['skipped'],
+                        action="append",
+                        help="Skip tests marked with a tag.")
 
     parser.add_argument("--stop-on-error",
                         dest="stop_on_error",
@@ -170,6 +192,7 @@ def prepare_parser():
                         default=None,
                         help="Generate perf.data from test in specified directory")
 
+    unstable_tests.add_args(parser)
     segmenting.add_args(parser)
 
     if platform != "win32":
@@ -244,7 +267,13 @@ def handle_options(options):
         tests_collection = parse_tests_file(options.tests_file)
     else:
         tests_collection = []
-    options.tests = split_tests_into_groups(tests_collection, options.test_type)
+    test_groups = split_tests_into_groups(tests_collection, options.test_type)
+    if not test_groups:
+        print("No input suites")
+        sys.exit(1)
+
+    verify_suite_files_unique(test_groups)
+    options.tests = select_test_groups(test_groups, options)
 
     options.configuration = 'Debug' if options.debug_mode else 'Release'
 
@@ -252,6 +281,13 @@ def handle_options(options):
         options.stats = segmenting.parse_stats_file(options.stats_file)
     else:
         options.stats = {}
+
+    if options.known_unstable_file:
+        options.known_unstable = unstable_tests.parse_file(options.known_unstable_file)
+        if options.tests:
+            unstable_tests.annotate_tests(options.tests, options.known_unstable)
+    else:
+        options.known_unstable = []
 
     if options.remote_server_full_directory is not None:
         if not os.path.isabs(options.remote_server_full_directory):
@@ -409,11 +445,17 @@ def print_failed_tests(options):
                 for i, fail in enumerate(failed[what]):
                     print("\t{0}. {1}".format(i + 1, fail))
 
-            print("Failed {} critical tests:".format(handler['type']))
-            _print_helper('mandatory')
-            if 'non_critical' in failed and failed['non_critical']:
+            if CRITICAL_TEST in failed and failed[CRITICAL_TEST]:
+                print("Failed {} critical tests:".format(handler['type']))
+                _print_helper(CRITICAL_TEST)
+
+            if TestTag.UNSTABLE in failed and failed[TestTag.UNSTABLE]:
+                print("Failed {} unstable tests:".format(handler['type']))
+                _print_helper(TestTag.UNSTABLE)
+
+            if TestTag.NON_CRITICAL in failed and failed[TestTag.NON_CRITICAL]:
                 print("Failed {} non-critical tests:".format(handler['type']))
-                _print_helper('non_critical')
+                _print_helper(TestTag.NON_CRITICAL)
             print("------")
 
 def print_rerun_trace(options):
@@ -479,8 +521,8 @@ def print_rerun_trace(options):
 #
 # when running multiple test suites returns TRUE if ANY failed due to a crash.
 def failed_due_to_crash(options, groups_segment) -> bool:
-    for (group, _) in groups_segment:
-        for suite in options.tests[group]:
+    for (_, group_suites) in groups_segment:
+        for suite in group_suites:
             if suite.tests_failed_due_to_renode_crash():
                 return True
 
@@ -563,6 +605,16 @@ def init_worker_process(counter, active_suites):
     shared_active_suites = active_suites
 
 
+def select_test_groups(groups: dict[str, list[Any]], options: argparse.Namespace) -> dict[str, list[Any]]:
+    selected_groups: dict[str, list[Any]] = {}
+    for group, suites in groups.items():
+        selected: list[Any] = [suite for suite in suites if suite.select_tests(options)]
+        if selected:
+            selected_groups[group] = selected
+
+    return selected_groups
+
+
 def run():
     parser = prepare_parser()
     for handler in registered_handlers:
@@ -572,16 +624,11 @@ def run():
     options = parser.parse_args()
     handle_options(options)
 
-    if not options.tests:
-        sys.exit(1)
-
     for handler in registered_handlers:
         if 'after_parsing' in handler and handler['after_parsing'] is not None:
             handler['after_parsing'](options)
 
     configure_output(options)
-
-    verify_suite_files_unique(options.tests)
 
     print("Preparing suites")
 
@@ -590,7 +637,7 @@ def run():
     max_segments = segment.subset.max_segments 
     segment_test_file_paths = segment.test_file_paths
     groups_segment  = segment.groups
-    total_number_of_suites = len(segment_test_file_paths)
+    total_number_of_suites = len(segment_test_file_paths) * options.iteration_count
 
     print_suite_files(segment)
 
@@ -598,12 +645,16 @@ def run():
         print("Exiting early due to --dry-run")
         exit(0)
 
+    if not groups_segment:
+        print("No tests selected for this segment.")
+        return
+
     args = []
     for (_, group_suites) in groups_segment:
         args.append((group_suites, total_number_of_suites, options))
 
-    for (group, _) in groups_segment:
-        for suite in options.tests[group]:
+    for (_, group_suites) in groups_segment:
+        for suite in group_suites:
             res = suite.prepare(options)
             if res is not None and res != 0:
                 print("Build failure, not running tests.")
@@ -682,8 +733,8 @@ def run():
     # before the log files are cleaned up
     test_failed_due_to_crash: bool = tests_failed and failed_due_to_crash(options, groups_segment)
 
-    for (group, _) in groups_segment:
-        for suite in options.tests[group]:
+    for (_, group_suites) in groups_segment:
+        for suite in group_suites:
             type(suite).log_files = logs_per_type[type(suite)]
             suite.cleanup(options)
 
@@ -691,11 +742,14 @@ def run():
     if options.output is not sys.stdout:
         options.output.close()
 
-    if max_segments > 1: 
+    if max_segments > 1:
         print( f"Ran segment {segment_num}/{max_segments}, consisting of {total_number_of_suites} test files.")
     if tests_failed:
         print("Some tests failed :( See the list of failed tests below and logs for details!")
-        print_failed_tests(options)
+
+    print_failed_tests(options)
+
+    if tests_failed:
         print_rerun_trace(options)
         if test_failed_due_to_crash:
             print('Renode crashed during testing and caused a failure', file=sys.stderr)

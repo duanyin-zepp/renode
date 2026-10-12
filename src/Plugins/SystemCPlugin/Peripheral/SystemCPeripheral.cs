@@ -11,17 +11,20 @@ using System.Linq;
 using System.Threading;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Debugging;
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
+using Antmicro.Renode.Utilities;
 
 using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.SystemC
 {
-    public unsafe partial class SystemCPeripheral : IQuadWordPeripheral, IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, INumberedGPIOOutput, IGPIOReceiver, IDirectAccessPeripheral
+    public unsafe partial class SystemCPeripheral : IQuadWordPeripheral, IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IMultibyteWritePeripheral, INumberedGPIOOutput, IGPIOReceiver, IDirectAccessPeripheral, IHasBusRegistrationConstraints
     {
         public SystemCPeripheral(
                 IMachine machine,
@@ -63,6 +66,29 @@ namespace Antmicro.Renode.Peripherals.SystemC
             timesyncTimer = new LimitTimer(machine.ClockSource, timesyncFrequency, this, timerName, limit: timesyncLimit, enabled: false, eventEnabled: true, autoUpdate: true);
         }
 
+        public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
+        {
+            var result = new byte[count];
+            for(var i = 0; i < count; i++)
+            {
+                result[i] = ReadByte(offset + i);
+            }
+            return result;
+        }
+
+        public void WriteBytes(long offset, byte[] bytes, int startingIndex, int count, IPeripheral context = null)
+        {
+            if(bytes.Length < startingIndex + count)
+            {
+                throw new RecoverableException($"Bytes array needs to have at least {startingIndex + count} elements");
+            }
+
+            for(var i = 0; i < count; i++)
+            {
+                WriteByte(offset + i, bytes[startingIndex + i]);
+            }
+        }
+
         public ulong ReadQuadWord(long offset)
         {
             return Read(8, offset);
@@ -75,24 +101,13 @@ namespace Antmicro.Renode.Peripherals.SystemC
 
         public void Reset()
         {
-            var request = new RenodeMessage(RenodeAction.Reset, 0, 0, 0, 0);
+            var request = new RenodeMessage(RenodeAction.Reset, 0, 0, 0, 0, 0);
             SendRequest(request, out var response);
         }
 
         public void OnGPIO(int number, bool value)
         {
-            // When GPIO connections are initialized, OnGPIO is called with
-            // false value. The transport is not yet initialized in that case. We
-            // can safely return, no special initialization is required.
-            if(!connectionActive)
-            {
-                return;
-            }
-            this.NoisyLog("Renode-triggered GPIO {0}, value {1}", number, value);
-
-            var payload = value ? 1UL : 0UL;
-            var request = new RenodeMessage(RenodeAction.GPIOWrite, 0, 0, (ulong)number, payload);
-            SendRequest(request, out var response);
+            SendGpioUpdate(number, value, 0);
         }
 
         public void WriteDirect(byte dataLength, long offset, ulong value, byte connectionIndex)
@@ -145,6 +160,30 @@ namespace Antmicro.Renode.Peripherals.SystemC
             Write(1, offset, value);
         }
 
+        public void ValidateRegistrationPoint(BusRangeRegistration registrationPoint, IPeripheral context)
+        {
+            if(context is ICPU initiatorCpu)
+            {
+                AddInitiator(initiatorCpu);
+            }
+
+            if(context is not ICPUWithMMU cpuWithMmu)
+            {
+                return;
+            }
+
+            var pageSize = cpuWithMmu.PageSize;
+            if(registrationPoint.Range.StartAddress % pageSize == registrationPoint.Offset % pageSize)
+            {
+                return;
+            }
+
+            throw new RegistrationException(
+                $"SystemC peripheral registration at 0x{registrationPoint.Range.StartAddress:X} with offset 0x{registrationPoint.Offset:X} " +
+                $"is not aligned to the guest page size 0x{pageSize:X}."
+            );
+        }
+
         public void AddDirectConnection(byte connectionIndex, IDirectAccessPeripheral target)
         {
             if(directAccessPeripherals.ContainsKey(connectionIndex))
@@ -173,18 +212,117 @@ namespace Antmicro.Renode.Peripherals.SystemC
                     // Nothing to do on DMI disabled -> enabled transition.
                     return;
                 }
-                InvalidateDmiRegion(0, ulong.MaxValue);
+                InvalidateAllDmiRegions();
             }
         }
 
+        public bool DisableDebugAccess { get; set; }
+
+        public bool MapMemoryOnReadOrWriteOnlyDmiGrant { get; set; }
+
+        // NumberOfGPIOPins must be equal to renode_bridge.h:NUM_GPIO
+        public const int NumberOfGPIOPins = 1024;
+
+        // Registers the CPU as an initiator. Can be called before the peripheral is registered on the bus
+        // (e.g. from a constructor), so that per-initiator state (e.g. a deferred halt) is available early.
+        // Adding the same CPU again is a no-op.
+        protected void AddInitiator(ICPU cpu)
+        {
+            var initiatorId = cpu.MultiprocessingId;
+            lock(initiators)
+            {
+                if(initiators.TryGetValue(initiatorId, out var initiator))
+                {
+                    if(initiator.Cpu != cpu)
+                    {
+                        throw new RecoverableException($"CPUs {GetCpuDescription(initiator.Cpu)} and {GetCpuDescription(cpu)} share the multiprocessing id {initiatorId}; initiators must be uniquely identifiable");
+                    }
+                    return;
+                }
+
+                initiators[initiatorId] = new Initiator(cpu);
+            }
+        }
+
+        protected void SetDeferredHalt(ICPU cpu, bool value)
+        {
+            this.NoisyLog("Initiator {0}: Setting deferred halt to {1}", GetCpuDescription(cpu), value);
+            if(cpu.IsHalted && value)
+            {
+                this.DebugLog("Reset signal asserted, but {0} is already halted", GetCpuDescription(cpu));
+                return;
+            }
+
+            var initiatorId = cpu.MultiprocessingId;
+            lock(initiators)
+            {
+                if(!initiators.ContainsKey(initiatorId))
+                {
+                    throw new RecoverableException($"Trying to set a deferred halt on an unknown initiator: {GetCpuDescription(cpu)}");
+                }
+                initiators[initiatorId].DeferredHalt = value;
+            }
+        }
+
+        protected void SendGpioUpdate(int number, bool value, uint initiatorId)
+        {
+            // When GPIO connections are initialized, OnGPIO is called with
+            // false value. The transport is not yet initialized in that case. We
+            // can safely return, no special initialization is required.
+            if(!connectionActive)
+            {
+                return;
+            }
+            this.NoisyLog("Renode-triggered GPIO {0}, value {1}", number, value);
+
+            var payload = value ? 1UL : 0UL;
+            var request = new RenodeMessage(RenodeAction.GPIOWrite, 0, 0, initiatorId, (ulong)number, payload);
+            SendRequest(request, out var _);
+        }
+
+        protected virtual void HandleGpioWrite(int number, bool value, uint initiatorId)
+        {
+            Connections[number].Set(value);
+        }
+
         protected readonly IMachine machine;
+
+        private static string GetCpuDescription(ICPU cpu)
+        {
+            return cpu.TryGetMachine(out var _)
+                ? cpu.GetName()
+                : $"{cpu.GetType().Name} with multiprocessing id {cpu.MultiprocessingId}";
+        }
+
+        private static BusAccessError TlmStatusErrorToBusAccessError(TlmStatus tlmStatus)
+        {
+            switch(tlmStatus)
+            {
+            case TlmStatus.Ok:
+                throw new ArgumentException("TLM ok is not an error");
+            case TlmStatus.Incomplete:
+                throw new ArgumentException("Incomplete TLM transaction");
+            case TlmStatus.GenericError:
+                return BusAccessError.GenericError;
+            case TlmStatus.AddressError:
+                return BusAccessError.AddressError;
+            case TlmStatus.CommandError:
+                return BusAccessError.CommandError;
+            case TlmStatus.BurstError:
+                return BusAccessError.BurstError;
+            case TlmStatus.ByteEnableError:
+                return BusAccessError.ByteEnableError;
+            default:
+                throw new ArgumentException("Unexpected TLM status");
+            }
+        }
 
         private ulong Read(byte dataLength, long offset, byte connectionIndex = 0, bool skipDmi = false)
         {
             var value = ReadInternal(RenodeAction.Read, dataLength, offset, connectionIndex, out var dmiAllowed);
             if(!skipDmi && dmiAllowed)
             {
-                TryMapDmiRegion((ulong)offset);
+                TryMapDmiRegion((ulong)offset, true);
             }
             return value;
         }
@@ -192,16 +330,50 @@ namespace Antmicro.Renode.Peripherals.SystemC
         private ulong ReadInternal(RenodeAction action, byte dataLength, long offset, byte connectionIndex, out bool dmiAllowed)
         {
             dmiAllowed = false;
-            var request = new RenodeMessage(action, dataLength, connectionIndex, (ulong)offset, 0);
+            DebugHelper.Assert(dataLength <= 8);
+            var extensionFields = GetExtensionFields(out _, out _, out var semihosting, out var initiatorId);
+            var dataLengthWithExtensionFields = (byte)(extensionFields | dataLength);
+            var onCpuThread = sysbus.TryGetCurrentCPU(out var cpu) && cpu.OnPossessedThread;
+            if(!DisableDebugAccess && (!onCpuThread || semihosting))
+            {
+                action = RenodeAction.ReadDebug;
+            }
+            var request = new RenodeMessage(action, dataLengthWithExtensionFields, connectionIndex, initiatorId, (ulong)offset, 0);
+
             if(!SendRequest(request, out var response))
             {
                 this.Log(LogLevel.Error, "Request to SystemCPeripheral failed, Read will return 0.");
                 return 0;
             }
 
-            TryToSkipTransactionTime(response.Address);
-            dmiAllowed = response.ConnectionIndex == DmiSupported;
+            // Debug transaction doesn't return status in response, so assume ok.
+            var status = TlmStatus.Ok;
+            if(action != RenodeAction.ReadDebug)
+            {
+                status = (TlmStatus)response.DataLength;
+                if(status != TlmStatus.Ok)
+                {
+                    this.WarningLog("Read transaction of width {0} to offset 0x{1:X} failed with status: {2}", dataLength, offset, status);
+                }
+            }
 
+            if(onCpuThread && TryApplyDeferredHalt(initiatorId))
+            {
+                // The CPU has just been halted to be held in reset, after letting this transaction finish.
+                // Faulting, charging transaction time, or mapping DMI would all outlive the reset or deadlock the halting CPU thread.
+                return response.Payload;
+            }
+
+            if(onCpuThread && !semihosting)
+            {
+                if(status != TlmStatus.Ok)
+                {
+                    throw new BusAccessException(TlmStatusErrorToBusAccessError(status));
+                }
+
+                TryToSkipTransactionTime(response.Address);
+                dmiAllowed = response.ConnectionIndex == DmiSupported;
+            }
             return response.Payload;
         }
 
@@ -210,22 +382,57 @@ namespace Antmicro.Renode.Peripherals.SystemC
             WriteInternal(RenodeAction.Write, dataLength, offset, value, connectionIndex, out var dmiAllowed);
             if(!skipDmi && dmiAllowed)
             {
-                TryMapDmiRegion((ulong)offset);
+                TryMapDmiRegion((ulong)offset, false);
             }
         }
 
         private void WriteInternal(RenodeAction action, byte dataLength, long offset, ulong value, byte connectionIndex, out bool dmiAllowed)
         {
             dmiAllowed = false;
-            var request = new RenodeMessage(action, dataLength, connectionIndex, (ulong)offset, value);
+            DebugHelper.Assert(dataLength <= 8);
+            var extensionFields = GetExtensionFields(out _, out _, out var semihosting, out var initiatorId);
+            var dataLengthWithExtensionFields = (byte)(extensionFields | dataLength);
+            var onCpuThread = sysbus.TryGetCurrentCPU(out var cpu) && cpu.OnPossessedThread;
+            if(!DisableDebugAccess && (!onCpuThread || semihosting))
+            {
+                action = RenodeAction.WriteDebug;
+            }
+            var request = new RenodeMessage(action, dataLengthWithExtensionFields, connectionIndex, initiatorId, (ulong)offset, value);
+
             if(!SendRequest(request, out var response))
             {
                 this.Log(LogLevel.Error, "Request to SystemCPeripheral failed, Write will have no effect.");
                 return;
             }
 
-            TryToSkipTransactionTime(response.Address);
-            dmiAllowed = response.ConnectionIndex == DmiSupported;
+            // Debug transaction doesn't return status in response, so assume ok.
+            var status = TlmStatus.Ok;
+            if(action != RenodeAction.WriteDebug)
+            {
+                status = (TlmStatus)response.DataLength;
+                if(status != TlmStatus.Ok)
+                {
+                    this.WarningLog("Write transaction of width {0} to offset 0x{1:X} failed with status: {2}", dataLength, offset, status);
+                }
+            }
+
+            if(onCpuThread && TryApplyDeferredHalt(initiatorId))
+            {
+                // The CPU has just been halted to be held in reset, after letting this transaction finish.
+                // Faulting, charging transaction time, or mapping DMI would all outlive the reset or deadlock the halting CPU thread.
+                return;
+            }
+
+            if(onCpuThread && !semihosting)
+            {
+                if(status != TlmStatus.Ok)
+                {
+                    throw new BusAccessException(TlmStatusErrorToBusAccessError(status));
+                }
+
+                TryToSkipTransactionTime(response.Address);
+                dmiAllowed = response.ConnectionIndex == DmiSupported;
+            }
         }
 
         private ulong GetCurrentVirtualTimeUS()
@@ -264,7 +471,7 @@ namespace Antmicro.Renode.Peripherals.SystemC
         {
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
-                var request = new RenodeMessage(RenodeAction.Timesync, 0, 0, 0, GetCurrentVirtualTimeUS());
+                var request = new RenodeMessage(RenodeAction.Timesync, 0, 0, 0, 0, GetCurrentVirtualTimeUS());
                 SendRequest(request, out var response);
             });
         }
@@ -282,14 +489,17 @@ namespace Antmicro.Renode.Peripherals.SystemC
 
                 switch(message.ActionId)
                 {
+                case RenodeAction.Init:
+                    SetupTimesync();
+                    var timesyncResponse = new RenodeMessage(RenodeAction.Init, 0, 0, 0, 0, (ulong)timeSyncPeriodUS);
+                    SendBackwardResponse(timesyncResponse);
+                    break;
                 case RenodeAction.GPIOWrite:
-                    // We have to respond before GPIO state is changed, because SystemC is blocked until
-                    // it receives the response. Setting the GPIO may require it to respond, e. g. when it
-                    // is interracted with from an interrupt handler.
-                    SendBackwardResponse(message);
                     var gpioNumber = (int)message.Address;
                     var isSet = message.Payload == 1;
-                    Connections[gpioNumber].Set(isSet);
+                    var initiatorId = message.InitiatorId;
+                    HandleGpioWrite(gpioNumber, isSet, initiatorId);
+                    SendBackwardResponse(message);
                     this.NoisyLog("SystemC-triggered GPIO {0}, value {1}", gpioNumber, isSet);
                     break;
                 case RenodeAction.Write:
@@ -327,7 +537,7 @@ namespace Antmicro.Renode.Peripherals.SystemC
                                 message.DataLength, (long)message.Address, message.Payload, message.ConnectionIndex);
                     }
                     var writeResponseMessage = new RenodeMessage(message.ActionId, message.DataLength,
-                            writeToSharedMem ? (byte)RenodeMessage.DMIAllowed : (byte)RenodeMessage.DMINotAllowed, message.Address, message.Payload);
+                            writeToSharedMem ? (byte)RenodeMessage.DMIAllowed : (byte)RenodeMessage.DMINotAllowed, message.InitiatorId, message.Address, message.Payload);
                     SendBackwardResponse(writeResponseMessage);
                     break;
                 case RenodeAction.Read:
@@ -365,7 +575,7 @@ namespace Antmicro.Renode.Peripherals.SystemC
                         payload = directAccessPeripherals[message.GetDirectConnectionIndex()].ReadDirect(message.DataLength, (long)message.Address, message.ConnectionIndex);
                     }
                     var readResponseMessage = new RenodeMessage(message.ActionId, message.DataLength,
-                            readFromSharedMem ? (byte)RenodeMessage.DMIAllowed : (byte)RenodeMessage.DMINotAllowed, message.Address, payload);
+                            readFromSharedMem ? (byte)RenodeMessage.DMIAllowed : (byte)RenodeMessage.DMINotAllowed, message.InitiatorId, message.Address, payload);
 
                     SendBackwardResponse(readResponseMessage);
                     break;
@@ -396,7 +606,7 @@ namespace Antmicro.Renode.Peripherals.SystemC
                     SendBackwardResponse(message);
                     break;
                 case RenodeAction.InvalidateDmiRange:
-                    InvalidateDmiRegion(message.Address, message.Payload);
+                    InvalidateDmiRegion(message.Address, message.Payload, message.InitiatorId);
                     SendBackwardResponse(message);
                     break;
                 default:
@@ -420,6 +630,10 @@ namespace Antmicro.Renode.Peripherals.SystemC
 
         private void TryToSkipTransactionTime(ulong timeUS)
         {
+            if(timeUS == 0)
+            {
+                return;
+            }
             if(machine.SystemBus.TryGetCurrentCPU(out var icpu))
             {
                 var baseCPU = icpu as BaseCPU;
@@ -439,7 +653,7 @@ namespace Antmicro.Renode.Peripherals.SystemC
         /// After receiving a native pointer, it attempts to register it for use by TranslationCPU.
         /// </summary>
         /// <param name="offset">address in target's address space</param>
-        private void TryMapDmiRegion(ulong offset)
+        private void TryMapDmiRegion(ulong offset, bool isRead)
         {
             if(disableNativeDmi)
             {
@@ -456,20 +670,28 @@ namespace Antmicro.Renode.Peripherals.SystemC
                 return;
             }
 
-            foreach(var registrationPoint in sysbus.GetRegistrationPoints(this))
+            // RenodeMessage.dataLength field for DMIReq indicates the kind of DMI access being requested.
+            var dataLength = isRead ? (byte)TlmCommand.Read : (byte)TlmCommand.Write;
+            DebugHelper.Assert(dataLength <= 8);
+            var extensionFields = GetExtensionFields(out _, out _, out var semihosting, out var initiatorId);
+
+            DebugHelper.Assert(!semihosting, "Mapping memory during semihosting call is forbidden");
+
+            lock(initiators)
             {
-                if(registrationPoint.Initiator != cpu)
+                if(!initiators.TryGetValue(initiatorId, out var initiator))
                 {
-                    // Memory is mapped only when SystemC peripheral has a single initiator which is the current cpu.
-                    // Otherwise unmapping memory in multicore machine would be ambigous and we could accidentaly unmap
-                    // memory not owned by SystemC from the other core.
-                    this.WarningLog("Peripheral must have unambiguous cpu initiator to support mapping of DMI region, try registering it for cpu context");
+                    this.WarningLog("Trying to map memory on an undefined initiator with id: {0}", initiatorId);
+                    return;
+                }
+                else if(initiator.MappedRanges.ContainsPoint(offset))
+                {
                     return;
                 }
             }
 
-            // RenodeMessage.dataLength field for DMIReq indicates the kind of DMI access being requested.
-            var request = new RenodeMessage(RenodeAction.DMIReq, (byte)TlmCommand.Read, 0, offset, 0);
+            var dataLengthWithExtensionFields = (byte)(extensionFields | dataLength);
+            var request = new RenodeMessage(RenodeAction.DMIReq, dataLengthWithExtensionFields, 0, initiatorId, offset, 0);
             if(!SendDmiRequest(request, out var dmiNativeMessage))
             {
                 this.ErrorLog("Unable to receive response to DMI request");
@@ -481,65 +703,45 @@ namespace Antmicro.Renode.Peripherals.SystemC
             var endAddress = dmiNativeMessage.EndAddress;
             var mappedAddress = checked((nint)dmiNativeMessage.Pointer);
 
-            if(dmiAccess == DmiAccess.None || mappedAddress == IntPtr.Zero || endAddress < startAddress)
+            var allowToMap = MapMemoryOnReadOrWriteOnlyDmiGrant ? dmiAccess != DmiAccess.None : dmiAccess == DmiAccess.ReadWrite;
+            if(!allowToMap || mappedAddress == IntPtr.Zero || endAddress < startAddress)
             {
                 return;
-            }
-
-            if(!dmiAccess.HasFlag(DmiAccess.Read))
-            {
-                // The requested access was not granted to the initiator.
-                this.WarningLog("DMI read access wasn't granted to the initiator, memory won't be mapped");
-                return;
-            }
-
-            if(dmiAccess != DmiAccess.ReadWrite)
-            {
-                // The target is allowed to promote Read/Write request to Read+Write.
-                // If it hasn't done so, we can't tell whether it's on purpose
-                // to ensure the other direction goes via blocking transport.
-                // Currently we don't support memory mapping for read or write only,
-                // so to ensure both access types are supported, we issue another DMI request
-                // with the other access type.
-                request = new RenodeMessage(RenodeAction.DMIReq, (byte)TlmCommand.Write, 0, offset, 0);
-                if(!SendDmiRequest(request, out dmiNativeMessage))
-                {
-                    this.ErrorLog("Unable to receive response to DMI request");
-                    return;
-                }
-
-                // At SystemC level, a target wishing to deny read and write access to the DMI region
-                // should set the granted access type to DMI_ACCESS_READ_WRITE, not to DMI_ACCESS_NONE.
-                // The rejection status is returned by get_direct_mem_ptr.
-                // When access is denied, Renode SystemC bridge always sends back DMI_ACCESS_NONE.
-                var dmiAccessWrite = dmiNativeMessage.DmiAccess;
-                var startAddressWrite = dmiNativeMessage.StartAddress;
-                var endAddressWrite = dmiNativeMessage.EndAddress;
-                var mappedAddressWrite = checked((nint)dmiNativeMessage.Pointer);
-
-                if(!dmiAccessWrite.HasFlag(DmiAccess.Write))
-                {
-                    this.WarningLog("DMI write access wasn't granted to the initiator, memory won't be mapped");
-                    return;
-                }
-
-                if(startAddress != startAddressWrite || endAddress != endAddressWrite || mappedAddress != mappedAddressWrite)
-                {
-                    this.WarningLog("Inconsistency between DMI response for read and write access request to address 0x{0:X}, memory won't be mapped", offset);
-                    return;
-                }
             }
 
             // Read+Write DMI access was confirmed, proceed to memory mapping.
             var range = startAddress.To(endAddress);
+            if(cpu is ICPUWithMMU cpuWithMmu)
+            {
+                // The DMI region has to be aligned to the guest page size
+                // to be registered in tlib. Shrink the range to the aligned
+                // part of the region so that no memory outside of it is mapped.
+                var pageSize = cpuWithMmu.PageSize;
+                var alignedStartAddress = range.StartAddress.AlignUpToMultipleOf(pageSize);
+                var alignedEndAddressExclusive = (range.EndAddress + 1).AlignDownToMultipleOf(pageSize);
+                if(alignedEndAddressExclusive <= alignedStartAddress)
+                {
+                    this.WarningLog("SystemC returned a DMI region {0} that doesn't cover a full guest page, memory won't be mapped", range);
+                    return;
+                }
+                range = new Range(alignedStartAddress, alignedEndAddressExclusive - alignedStartAddress);
+            }
+
             if(!range.Contains(offset))
             {
                 this.WarningLog("SystemC returned a DMI region {0} that does not contain requested offset 0x{1:X}.", range, offset);
                 return;
             }
 
-            lock(mappedDmiRanges)
+            lock(initiators)
             {
+                if(!initiators.TryGetValue(initiatorId, out var initiator))
+                {
+                    return;
+                }
+
+                var mappedDmiRanges = initiator.MappedRanges;
+
                 if(mappedDmiRanges.ContainsWholeRange(range))
                 {
                     return;
@@ -556,91 +758,194 @@ namespace Antmicro.Renode.Peripherals.SystemC
                 }
 
                 mappedDmiRanges.Add(range);
-                foreach(var rangeToMap in rangesToMap)
+                this.DebugLog("Requested mapped SystemC DMI region {0}", range);
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
                 {
-                    var pointerOffset = (long)(rangeToMap.StartAddress - startAddress);
-                    var rangeMappedAddress = new IntPtr(mappedAddress + pointerOffset);
-                    sysbus.MapMemory(new DmiMappedSegment(rangeToMap.StartAddress, rangeToMap.Size, rangeMappedAddress), this, context: cpu as ICPUWithMappedMemory);
-                }
+                    MapRanges(rangesToMap, startAddress, mappedAddress, cpu);
+                    this.DebugLog("Mapped SystemC DMI region {0}", range);
+                }, true);
             }
-
-            this.DebugLog("Mapped SystemC DMI region {0}", range);
         }
 
-        private void InvalidateDmiRegion(ulong startAddress, ulong endAddress)
+        private void MapRanges(List<Range> rangesToMap, ulong startAddress, nint mappedAddress, ICPU cpu)
         {
-            this.DebugLog("Requested invalidation of SystemC DMI region <0x{0:X}, 0x{1:X}>", startAddress, endAddress);
+            foreach(var rangeToMap in rangesToMap)
+            {
+                var pointerOffset = (long)(rangeToMap.StartAddress - startAddress);
+                var rangeMappedAddress = new IntPtr(mappedAddress + pointerOffset);
+                sysbus.MapMemory(new DmiMappedSegment(rangeToMap.StartAddress, rangeToMap.Size, rangeMappedAddress), this, context: cpu as ICPUWithMappedMemory);
+            }
+        }
+
+        private void InvalidateDmiRegion(ulong startAddress, ulong endAddress, uint initiatorId)
+        {
             if(startAddress == 0 && endAddress == ulong.MaxValue)
             {
                 // <0, ulong.MaxValue> ranges aren't currently supported
                 endAddress -= 1;
             }
 
-            ICPUWithMappedMemory cpu = null;
-            var busRanges = new List<BusRangeRegistration>();
-            foreach(var context in sysbus.GetAllContextKeys())
+            lock(initiators)
             {
-                foreach(var registration in sysbus.GetRegisteredPeripherals(context))
+                if(!initiators.TryGetValue(initiatorId, out var initiator))
                 {
-                    if(registration.Peripheral != this)
-                    {
-                        continue;
-                    }
-                    var initiator = registration.RegistrationPoint.Initiator;
-                    if(initiator == null)
-                    {
-                        this.WarningLog("Peripheral must have unambiguous cpu initiator to support mapping of DMI region, try registering it for cpu context");
-                        return;
-                    }
-                    else
-                    {
-                        if(cpu != null && initiator != cpu)
-                        {
-                            this.WarningLog("Peripheral must have unambiguous cpu initiator to support mapping of DMI region, try registering it for cpu context");
-                            return;
-                        }
-                        if(initiator is ICPUWithMappedMemory cpuWithMappedMemory)
-                        {
-                            cpu = cpuWithMappedMemory;
-                            busRanges.Add(registration.RegistrationPoint);
-                        }
-                    }
+                    return;
                 }
-            }
 
-            if(!(cpu is TranslationCPU translationCpu))
+                if(initiator.Cpu is not TranslationCPU translationCpu)
+                {
+                    this.WarningLog("Ensure there is at least one uniquely identifiable CPU initiator registered for the peripheral");
+                    return;
+                }
+
+                var mappedDmiRanges = initiator.MappedRanges;
+                var range = (startAddress).To(endAddress);
+                // The range has to be aligned to the guest page size
+                // to be unregistered from tlib. Expand it to the
+                // aligned boundaries to make sure the whole region
+                // is invalidated.
+                var pageSize = translationCpu.PageSize;
+                var alignedStartAddress = range.StartAddress.AlignDownToMultipleOf(pageSize);
+                var alignedEndAddressExclusive = (range.EndAddress + 1).AlignUpToMultipleOf(pageSize);
+                range = new Range(alignedStartAddress, alignedEndAddressExclusive - alignedStartAddress);
+
+                // Don't use lazy evaluation for `intersectingRanges`.
+                // The collection is modified right below, and the callback
+                // would otherwise see the modified state at the next sync point.
+                var intersectingRanges = mappedDmiRanges.Select(collectionRange => collectionRange.Intersect(range)).Where(r => r.HasValue).ToList();
+                mappedDmiRanges.Remove(range);
+                this.DebugLog("Requested invalidation of SystemC DMI region <0x{0:X}, 0x{1:X}>", startAddress, endAddress);
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+                {
+                    UnmapRanges(intersectingRanges, initiator);
+                    this.DebugLog("Invalidated SystemC DMI region <0x{0:X}, 0x{1:X}>", startAddress, endAddress);
+                }, true);
+            }
+        }
+
+        private void UnmapRanges(IEnumerable<Range?> ranges, Initiator initiator)
+        {
+            var translationCpu = initiator.Cpu as TranslationCPU;
+            var baseAddresses = sysbus.GetRegisteredPeripherals(translationCpu)
+                .Where(registered => registered.Peripheral == this)
+                .Select(registered => registered.RegistrationPoint.Range.StartAddress - registered.RegistrationPoint.Offset)
+                .ToList();
+            if(!baseAddresses.Any())
             {
+                this.ErrorLog("Unable to unmap DMI regions of {0}: the peripheral is not registered for this CPU", GetCpuDescription(translationCpu));
                 return;
             }
 
-            lock(mappedDmiRanges)
+            foreach(var range in ranges)
             {
-                var range = startAddress.To(endAddress);
-                var intersectingRanges = mappedDmiRanges.Select(collectionRange => collectionRange.Intersect(range)).Where(r => r.HasValue);
-                foreach(var intersectingRange in intersectingRanges)
+                foreach(var baseAddress in baseAddresses)
                 {
-                    foreach(var busRange in busRanges)
+                    // MapMemory supports mapping segments with addresses relative to owner peripheral.
+                    // UnmapMemory always assumes absolute address, so take a registration offset into account.
+                    var invalidatedRange = new Range(checked(baseAddress + range.Value.StartAddress), range.Value.Size);
+                    try
                     {
-                        var invalidatedRange = new Range(checked(busRange.Range.StartAddress + intersectingRange.Value.StartAddress), intersectingRange.Value.Size);
-                        sysbus.UnmapMemory(invalidatedRange, context: cpu);
-                        translationCpu.OrderTranslationBlocksInvalidation(checked((nint)invalidatedRange.StartAddress), checked((nint)invalidatedRange.EndAddress));
-                        this.DebugLog("Unmapped SystemC DMI region {0}", invalidatedRange);
+                        sysbus.UnmapMemory(invalidatedRange, context: translationCpu);
                     }
+                    catch(RecoverableException)
+                    {
+                        this.DebugLog("Invalidated memory region is already unmapped {0}", invalidatedRange);
+                    }
+                    translationCpu.OrderTranslationBlocksInvalidation(checked((nint)invalidatedRange.StartAddress), checked((nint)invalidatedRange.EndAddress));
+                    this.DebugLog("Unmapped SystemC DMI region {0}", invalidatedRange);
                 }
-                mappedDmiRanges.Remove(range);
             }
+        }
+
+        private void InvalidateAllDmiRegions()
+        {
+            lock(initiators)
+            {
+                foreach(var initiatorId in initiators.Keys)
+                {
+                    InvalidateDmiRegion(0, ulong.MaxValue, initiatorId);
+                }
+            }
+        }
+
+        private bool TryApplyDeferredHalt(uint initiatorId)
+        {
+            lock(initiators)
+            {
+                if(initiators.TryGetValue(initiatorId, out var initiator) && initiator.DeferredHalt)
+                {
+                    initiator.Cpu.IsHalted = true;
+                    initiator.DeferredHalt = false;
+                    this.DebugLog("CPU halted after reset signal assertion, once the pending transaction finished");
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        private byte GetExtensionFields(out bool secure, out bool privileged, out bool semihosting, out uint initiatorId)
+        {
+            initiatorId = 0;
+            if(sysbus.TryGetTransactionInitiator(out var initiator))
+            {
+                if(initiator is CPUCore cpu)
+                {
+                    initiatorId = cpu.MultiprocessingId;
+                }
+            }
+            if(sysbus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var cpuState))
+            {
+                secure = cpuState.CpuSecure;
+                privileged = cpuState.Privileged;
+                semihosting = cpuState.Semihosting;
+            }
+            else
+            {
+                // Default values when transaction state isn't available.
+                secure = true;
+                privileged = true;
+                semihosting = false;
+            }
+
+            return GetExtensionFieldsMask(secure, privileged);
+        }
+
+        private byte GetExtensionFieldsMask(bool secure, bool privileged)
+        {
+            byte mask = 0;
+            if(secure)
+            {
+                mask |= 1 << 4;
+            }
+            if(privileged)
+            {
+                mask |= 1 << 5;
+            }
+            return mask;
         }
 
         private bool disableNativeDmi;
         private readonly LimitTimer timesyncTimer;
         private readonly Dictionary<int, IDirectAccessPeripheral> directAccessPeripherals;
-        private readonly MinimalRangesCollection mappedDmiRanges = new MinimalRangesCollection();
+        private readonly Dictionary<uint, Initiator> initiators = new Dictionary<uint, Initiator>();
         private readonly int timeSyncPeriodUS;
         private readonly IBusController sysbus;
-
-        // NumberOfGPIOPins must be equal to renode_bridge.h:NUM_GPIO
-        private const int NumberOfGPIOPins = 1024;
         private const int DmiSupported = 1;
+
+        private sealed class Initiator
+        {
+            public Initiator(ICPU cpu)
+            {
+                Cpu = cpu;
+                MappedRanges = new MinimalRangesCollection();
+            }
+
+            public ICPU Cpu { get; }
+
+            public MinimalRangesCollection MappedRanges { get; }
+
+            public bool DeferredHalt { get; set; }
+        }
 
         private sealed class DmiMappedSegment : IMappedSegment
         {
